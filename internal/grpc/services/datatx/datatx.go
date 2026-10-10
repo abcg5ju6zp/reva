@@ -121,12 +121,41 @@ func (s *service) UnprotectedEndpoints() []string {
 }
 
 func (s *service) CreateTransfer(ctx context.Context, req *datatx.CreateTransferRequest) (*datatx.CreateTransferResponse, error) {
-	txInfo, startTransferErr := s.txManager.CreateTransfer(ctx, req.SrcTargetUri, req.DestTargetUri)
 	log := appctx.GetLogger(ctx)
+	userID := appctx.ContextMustGetUser(ctx).GetId()
+
+	// Idempotency: the same request must never start a second job. If a
+	// transfer for the share this request is based on is already recorded,
+	// return its current state instead of starting another one.
+	if shareID := req.GetShareId(); shareID != nil {
+		existing, err := s.storageDriver.ListTransfers(
+			[]*datatx.ListTransfersRequest_Filter{{
+				Type: datatx.ListTransfersRequest_Filter_TYPE_SHARE_ID,
+				Term: &datatx.ListTransfersRequest_Filter_ShareId{ShareId: shareID},
+			}},
+			userID)
+		if err == nil && len(existing) > 0 {
+			txInfo, getErr := s.txManager.GetTransferStatus(ctx, existing[0].TxID)
+			txInfo.ShareId = &ocm.ShareId{OpaqueId: existing[0].ShareID}
+			if getErr != nil {
+				getErr = errors.Wrap(getErr, "datatx service: error retrieving existing transfer")
+				return &datatx.CreateTransferResponse{
+					Status: status.NewInternal(ctx, getErr, "error getting transfer status"),
+					TxInfo: txInfo,
+				}, getErr
+			}
+			log.Debug().Interface("txInfo", txInfo).Msg("CreateTransfer: returning existing transfer")
+			return &datatx.CreateTransferResponse{
+				Status: status.NewOK(ctx),
+				TxInfo: txInfo,
+			}, nil
+		}
+	}
+
+	txInfo, startTransferErr := s.txManager.CreateTransfer(ctx, req.SrcTargetUri, req.DestTargetUri)
 
 	// we always save the transfer regardless of start transfer outcome
 	// only then, if starting fails, can we try to restart it
-	userID := appctx.ContextMustGetUser(ctx).GetId()
 	transfer := &txdriver.Transfer{
 		TxID:          txInfo.GetId().OpaqueId,
 		SrcTargetURI:  req.SrcTargetUri,

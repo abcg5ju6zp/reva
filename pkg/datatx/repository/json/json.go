@@ -23,6 +23,7 @@ import (
 	"encoding/json"
 	"io"
 	"os"
+	"path/filepath"
 	"sync"
 
 	userv1beta1 "github.com/cs3org/go-cs3apis/cs3/identity/user/v1beta1"
@@ -82,9 +83,15 @@ func (m *mgr) StoreTransfer(transfer *datatx.Transfer) error {
 	m.Lock()
 	defer m.Unlock()
 
+	// roll back in-memory state on failure so memory matches disk
+	previous, existed := m.model.Transfers[transfer.TxID]
 	m.model.Transfers[transfer.TxID] = transfer
-	err := m.saveModel()
-	if err != nil {
+	if err := m.saveModel(); err != nil {
+		if existed {
+			m.model.Transfers[transfer.TxID] = previous
+		} else {
+			delete(m.model.Transfers, transfer.TxID)
+		}
 		return errors.Wrap(err, "error storing transfer")
 	}
 
@@ -154,13 +161,32 @@ func (m *mgr) ListTransfers(filters []*txv1beta.ListTransfersRequest_Filter, use
 func (m *mgr) saveModel() error {
 	data, err := json.Marshal(m.model)
 	if err != nil {
-		err = errors.Wrap(err, "datatx repository json driver: error encoding transfer data to json")
-		return err
+		return errors.Wrap(err, "datatx repository json driver: error encoding transfer data to json")
 	}
 
-	if err := os.WriteFile(m.config.File, data, 0644); err != nil {
-		err = errors.Wrap(err, "datatx repository json driver: error writing transfer data to file: "+m.config.File)
-		return err
+	// write to a temp file in the same directory and atomically rename it,
+	// so concurrent readers can never observe a truncated file
+	dir := filepath.Dir(m.config.File)
+	tmp, err := os.CreateTemp(dir, ".datatx-transfers-*.tmp")
+	if err != nil {
+		return errors.Wrap(err, "datatx repository json driver: error creating temporary file")
+	}
+	tmpName := tmp.Name()
+	defer func() { _ = os.Remove(tmpName) }()
+
+	if _, err := tmp.Write(data); err != nil {
+		_ = tmp.Close()
+		return errors.Wrap(err, "datatx repository json driver: error writing transfer data to temporary file")
+	}
+	if err := tmp.Chmod(0644); err != nil {
+		_ = tmp.Close()
+		return errors.Wrap(err, "datatx repository json driver: error setting file permissions")
+	}
+	if err := tmp.Close(); err != nil {
+		return errors.Wrap(err, "datatx repository json driver: error closing temporary file")
+	}
+	if err := os.Rename(tmpName, m.config.File); err != nil {
+		return errors.Wrap(err, "datatx repository json driver: error replacing transfer data file: "+m.config.File)
 	}
 
 	return nil
