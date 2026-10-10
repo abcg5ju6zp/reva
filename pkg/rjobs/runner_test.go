@@ -20,6 +20,7 @@ package rjobs
 
 import (
 	"context"
+	"errors"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -226,19 +227,36 @@ type jobFunc func(context.Context, Params) (Params, error)
 
 func (f jobFunc) Run(ctx context.Context, p Params) (Params, error) { return f(ctx, p) }
 
-// fakeStatus is an in-memory StatusStore. Like the real store, a Put never
-// clears the cancel intent: only RequestCancel owns it.
+// fakeStatus is an in-memory StatusStore that mirrors the SQL store's
+// ownership rules: lifecycle writes are conditioned on the attempt, a Put never
+// clears the cancel intent, the dedup key or the commit-phase marker, and
+// reservations enforce one active run per (owner, key).
 type fakeStatus struct {
-	mu  sync.Mutex
-	rec map[RunID]Status
+	mu      sync.Mutex
+	rec     map[RunID]Status
+	pending map[RunID]time.Time // publish-pending marker
+	keys    map[RunID]string    // active dedup key held per run
+
+	// commitFailFor makes CommitTerminal return an error for a run at the
+	// configured attempt, to simulate a terminal save failing before
+	// redelivery.
+	commitFailFor map[RunID]int
 }
 
-func newFakeStatus() *fakeStatus { return &fakeStatus{rec: make(map[RunID]Status)} }
+func newFakeStatus() *fakeStatus {
+	return &fakeStatus{
+		rec:           make(map[RunID]Status),
+		pending:       make(map[RunID]time.Time),
+		keys:          make(map[RunID]string),
+		commitFailFor: make(map[RunID]int),
+	}
+}
 
 func (f *fakeStatus) Put(_ context.Context, s Status) error {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	if cur, ok := f.rec[s.RunID]; ok {
+		// owned by other methods: never clobbered by a plain Put.
 		s.CancelRequested = cur.CancelRequested
 	}
 	f.rec[s.RunID] = s
@@ -271,21 +289,217 @@ func (f *fakeStatus) RequestCancel(_ context.Context, id RunID) (Status, error) 
 	return s, nil
 }
 
-// List, Reserve and Release are part of the StatusStore interface but are not
-// exercised by the cancellation tests; minimal implementations keep the fake
-// satisfying the interface.
 func (f *fakeStatus) List(context.Context, ListFilter) ([]Status, error) { return nil, nil }
 
-func (f *fakeStatus) Reserve(_ context.Context, s Status, _ string) (Status, bool, error) {
-	if err := f.Put(context.Background(), s); err != nil {
-		return Status{}, false, err
+func (f *fakeStatus) Reserve(_ context.Context, s Status, key string) (Status, bool, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	for id, k := range f.keys {
+		if k == key && f.rec[id].Owner == s.Owner {
+			return f.rec[id], false, nil
+		}
 	}
+	f.rec[s.RunID] = s
+	f.keys[s.RunID] = key
+	f.pending[s.RunID] = time.Now()
 	return s, true, nil
 }
 
-func (f *fakeStatus) Release(context.Context, RunID) error { return nil }
+func (f *fakeStatus) Release(_ context.Context, id RunID) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	delete(f.keys, id)
+	return nil
+}
+
+func (f *fakeStatus) MarkCommitted(_ context.Context, id RunID) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if s, ok := f.rec[id]; ok && s.State == StateQueued {
+		delete(f.pending, id)
+	}
+	return nil
+}
+
+// revoke is the shared revocation: failed record, key freed, marker kept.
+func (f *fakeStatus) revokeLocked(id RunID, reason string) bool {
+	s, ok := f.rec[id]
+	if !ok || s.State != StateQueued {
+		return false
+	}
+	if _, pending := f.pending[id]; !pending {
+		return false
+	}
+	now := time.Now()
+	s.State = StateFailed
+	s.FinishedAt = &now
+	s.LastError = reason
+	f.rec[id] = s
+	delete(f.keys, id)
+	return true
+}
+
+func (f *fakeStatus) Revoke(_ context.Context, id RunID, reason string) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.revokeLocked(id, reason)
+	return nil
+}
+
+func (f *fakeStatus) RevokePending(_ context.Context, grace time.Duration) ([]RunID, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	cutoff := time.Now().Add(-grace)
+	var out []RunID
+	for id, at := range f.pending {
+		if at.Before(cutoff) && f.revokeLocked(id, "pending") {
+			out = append(out, id)
+		}
+	}
+	return out, nil
+}
+
+func (f *fakeStatus) Adopt(_ context.Context, skeleton Status, attempt int) (AdoptDecision, Status, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if attempt <= 0 {
+		attempt = 1
+	}
+	s, ok := f.rec[skeleton.RunID]
+	if !ok {
+		now := time.Now()
+		s = Status{
+			RunID:      skeleton.RunID,
+			Job:        skeleton.Job,
+			State:      StateRunning,
+			Attempt:    attempt,
+			EnqueuedAt: skeleton.EnqueuedAt,
+			StartedAt:  &now,
+			Owner:      skeleton.Owner,
+		}
+		f.rec[s.RunID] = s
+		return AdoptExecute, s, nil
+	}
+
+	switch {
+	case s.State == StateSucceeded || s.State == StateCancelled:
+		return AdoptObsolete, s, nil
+	case s.State == StateFailed:
+		if _, pending := f.pending[s.RunID]; pending {
+			return AdoptObsolete, s, nil
+		}
+	case s.Attempt > attempt:
+		return AdoptObsolete, s, nil
+	case s.Attempt == attempt && s.State == StateRunning:
+		return AdoptObsolete, s, nil
+	}
+
+	resubmit := s.Result != nil
+	s.Attempt = attempt
+	if s.CancelRequested {
+		s.State = StateCancelling
+	} else {
+		s.State = StateRunning
+	}
+	s.FinishedAt = nil
+	s.LastError = ""
+	delete(f.pending, s.RunID)
+	if !resubmit {
+		now := time.Now()
+		s.StartedAt = &now
+	}
+	f.rec[s.RunID] = s
+	if resubmit {
+		return AdoptResubmit, s, nil
+	}
+	return AdoptExecute, s, nil
+}
+
+func (f *fakeStatus) StageResult(_ context.Context, id RunID, attempt int, result Params) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	s, ok := f.rec[id]
+	if !ok || s.Attempt != attempt || (s.State != StateRunning && s.State != StateCancelling) {
+		return errtypes.NotFound("fenced")
+	}
+	s.Result = result
+	f.rec[id] = s
+	return nil
+}
+
+func (f *fakeStatus) MarkFailed(_ context.Context, id RunID, attempt int, lastError string, at time.Time) (bool, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	s, ok := f.rec[id]
+	if !ok || s.Attempt != attempt {
+		return false, nil
+	}
+	if s.State == StateSucceeded || s.State == StateCancelled || s.State == StateCancelling {
+		return false, nil
+	}
+	s.State = StateFailed
+	s.FinishedAt = &at
+	s.LastError = lastError
+	f.rec[id] = s
+	return true, nil
+}
+
+func (f *fakeStatus) CommitTerminal(_ context.Context, st Status) (bool, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if a, fail := f.commitFailFor[st.RunID]; fail && a == st.Attempt {
+		return false, errors.New("injected terminal commit failure")
+	}
+	cur, ok := f.rec[st.RunID]
+	if !ok || cur.Attempt != st.Attempt {
+		return false, nil
+	}
+	if cur.State == StateSucceeded || cur.State == StateCancelled {
+		return false, nil
+	}
+	// a recorded cancel intent blocks a competing success; the cancel commit
+	// itself is allowed from running (broadcast-only cancel) or cancelling.
+	if st.State == StateSucceeded && cur.State == StateCancelling {
+		return false, nil
+	}
+	st.CancelRequested = cur.CancelRequested
+	f.rec[st.RunID] = st
+	return true, nil
+}
 
 func (f *fakeStatus) Close(context.Context) error { return nil }
+
+// test helpers
+
+func (f *fakeStatus) keyOf(id RunID) (string, bool) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	k, ok := f.keys[id]
+	return k, ok
+}
+
+func (f *fakeStatus) pendingOf(id RunID) (time.Time, bool) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	at, ok := f.pending[id]
+	return at, ok
+}
+
+func (f *fakeStatus) putPending(id RunID, s Status, key string, at time.Time) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.rec[id] = s
+	f.pending[id] = at
+	if key != "" {
+		f.keys[id] = key
+	}
+}
+
+func (f *fakeStatus) revokeDirect(id RunID, reason string) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.revokeLocked(id, reason)
+}
 
 // oneRunStore hands out exactly one run, then blocks Claim until shutdown. It
 // records whether the run was Completed (acked) or Failed (retried).
@@ -646,5 +860,489 @@ func TestCancelPeriodicStopsInFlightRun(t *testing.T) {
 	// With nothing in flight, a second cancel is an error, not a silent no-op.
 	if err := r.CancelPeriodic(context.Background(), "test.periodic"); err == nil {
 		t.Error("expected an error cancelling a job with no run in flight")
+	}
+}
+
+// scriptedStore plays back a fixed list of deliveries. The second delivery is
+// held back until gate2 is closed, so a test can force a redelivery to race
+// with the first attempt on its own terms. It records enqueues, acks and naks.
+type scriptedStore struct {
+	stubStore
+	mu         sync.Mutex
+	deliveries []Run
+	next       int
+	gate2      chan struct{}
+	enqErr     error
+	enqueued   []Run
+	completed  int
+	failed     []RunID
+}
+
+func (s *scriptedStore) Enqueue(_ context.Context, r Run) (RunID, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.enqErr != nil {
+		return "", s.enqErr
+	}
+	s.enqueued = append(s.enqueued, r)
+	return r.ID, nil
+}
+
+func (s *scriptedStore) Claim(ctx context.Context) (Run, error) {
+	s.mu.Lock()
+	idx := s.next
+	if idx < len(s.deliveries) {
+		s.next++
+		run := s.deliveries[idx]
+		gate := s.gate2
+		s.mu.Unlock()
+		if idx == 1 && gate != nil {
+			select {
+			case <-gate:
+			case <-ctx.Done():
+				return Run{}, ctx.Err()
+			}
+		}
+		return run, nil
+	}
+	s.mu.Unlock()
+	<-ctx.Done()
+	return Run{}, ctx.Err()
+}
+
+func (s *scriptedStore) Complete(context.Context, RunID) error {
+	s.mu.Lock()
+	s.completed++
+	s.mu.Unlock()
+	return nil
+}
+
+func (s *scriptedStore) Fail(_ context.Context, id RunID, _ time.Duration) error {
+	s.mu.Lock()
+	s.failed = append(s.failed, id)
+	s.mu.Unlock()
+	return nil
+}
+
+func (s *scriptedStore) HeartbeatInterval() time.Duration { return 0 }
+
+func (s *scriptedStore) completions() int {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.completed
+}
+
+// eventually polls fn until it returns true or the deadline passes.
+func eventually(t *testing.T, timeout time.Duration, fn func() bool) {
+	t.Helper()
+	deadline := time.Now().Add(timeout)
+	for time.Now().Before(deadline) {
+		if fn() {
+			return
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	t.Fatal("condition not met in time")
+}
+
+func registerTestJob(t *testing.T, name string, fn func(context.Context, Params) (Params, error)) {
+	t.Helper()
+	if err := RegisterOnDemand(name, func(context.Context, map[string]any) (Job, error) {
+		return jobFunc(fn), nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestEnqueuePreassignsStableIdentity(t *testing.T) {
+	resetRegistry()
+	registerTestJob(t, "test.identity", func(context.Context, Params) (Params, error) { return nil, nil })
+
+	store := &scriptedStore{}
+	status := newFakeStatus()
+	r, err := NewRunner(context.Background(), Options{Workers: 1, Store: store, Status: status})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	id, err := r.Enqueue(context.Background(), "test.identity", Params{"x": 1}, WithOwner("alice"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if id == "" {
+		t.Fatal("enqueue must return the stable run id")
+	}
+	if len(store.enqueued) != 1 || store.enqueued[0].ID != id {
+		t.Fatalf("the queue message must carry the preassigned id, got %+v", store.enqueued)
+	}
+	msg := store.enqueued[0]
+	if msg.Attempt != 1 || msg.EnqueuedAt.IsZero() || msg.Owner != "alice" {
+		t.Fatalf("message identity not fixed before publish: %+v", msg)
+	}
+	// on success the run is immediately queryable.
+	st, err := status.Get(context.Background(), id)
+	if err != nil {
+		t.Fatalf("queued run must be queryable: %v", err)
+	}
+	if st.State != StateQueued || !st.EnqueuedAt.Equal(msg.EnqueuedAt) {
+		t.Fatalf("unexpected queued status: %+v", st)
+	}
+}
+
+func TestEnqueueUniqueCommitsPhase(t *testing.T) {
+	resetRegistry()
+	registerTestJob(t, "test.unique-ok", func(context.Context, Params) (Params, error) { return nil, nil })
+
+	store := &scriptedStore{}
+	status := newFakeStatus()
+	r, err := NewRunner(context.Background(), Options{Workers: 1, Store: store, Status: status})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	id, err := r.Enqueue(context.Background(), "test.unique-ok", nil, Unique("space:1"), WithOwner("alice"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, ok := status.pendingOf(id); ok {
+		t.Error("the publish-pending marker must be cleared after a successful publish")
+	}
+	if k, ok := status.keyOf(id); !ok || k != "space:1" {
+		t.Errorf("the dedup key stays held until the run finishes, got %q/%v", k, ok)
+	}
+
+	// a concurrent enqueue collapses onto the same run and publishes nothing.
+	id2, err := r.Enqueue(context.Background(), "test.unique-ok", nil, Unique("space:1"), WithOwner("alice"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if id2 != id || len(store.enqueued) != 1 {
+		t.Fatalf("conflict must collapse onto the holder, id=%v enqueues=%d", id2, len(store.enqueued))
+	}
+}
+
+func TestEnqueueUniquePublishFailureRevokesPlaceholder(t *testing.T) {
+	resetRegistry()
+	registerTestJob(t, "test.unique-fail", func(context.Context, Params) (Params, error) { return nil, nil })
+
+	store := &scriptedStore{enqErr: errors.New("nats unavailable")}
+	status := newFakeStatus()
+	r, err := NewRunner(context.Background(), Options{Workers: 1, Store: store, Status: status})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	id, err := r.Enqueue(context.Background(), "test.unique-fail", nil, Unique("space:2"), WithOwner("alice"))
+	if err == nil {
+		t.Fatal("a failed publish must fail the enqueue")
+	}
+	if id != "" {
+		t.Fatalf("failed enqueue must not return an id, got %q", id)
+	}
+
+	// the failed enqueue leaves exactly one, revoked record.
+	var only RunID
+	for rid := range snapshotRecs(status) {
+		only = rid
+	}
+	if only == "" {
+		t.Fatal("the revoked run must remain recorded as a failed run")
+	}
+	got, err := status.Get(context.Background(), only)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.State != StateFailed {
+		t.Fatalf("revoked placeholder must be a failed record, got %q", got.State)
+	}
+	if _, held := status.keyOf(only); held {
+		t.Error("the dedup key must be freed, not stuck behind a dead placeholder")
+	}
+	if _, ok := status.pendingOf(only); !ok {
+		t.Error("the marker is kept so a late message is recognised as obsolete")
+	}
+	// a message that nevertheless arrives is dropped at adoption, never run.
+	if decision, _, _ := status.Adopt(context.Background(),
+		Status{RunID: only, Job: "test.unique-fail", Attempt: 1, EnqueuedAt: time.Now()}, 1); decision != AdoptObsolete {
+		t.Fatalf("late message for a revoked row must be obsolete, got %v", decision)
+	}
+	// the key is immediately reusable.
+	now := time.Now()
+	if _, reserved, err := status.Reserve(context.Background(),
+		Status{RunID: "again", Job: "test.unique-fail", State: StateQueued, Attempt: 1, EnqueuedAt: now, Owner: "alice"},
+		"space:2"); err != nil || !reserved {
+		t.Fatalf("the key must be reusable: reserved=%v err=%v", reserved, err)
+	}
+}
+
+// snapshotRecs returns the ids currently recorded (test-only introspection).
+func snapshotRecs(f *fakeStatus) map[RunID]struct{} {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	out := make(map[RunID]struct{}, len(f.rec))
+	for id := range f.rec {
+		out[id] = struct{}{}
+	}
+	return out
+}
+
+func TestClaimRebuildsMissingStatus(t *testing.T) {
+	resetRegistry()
+	var ran int32
+	registerTestJob(t, "test.rebuild", func(context.Context, Params) (Params, error) {
+		atomic.AddInt32(&ran, 1)
+		return Params{"p": "v"}, nil
+	})
+
+	enqueued := time.Now().Add(-time.Minute).Truncate(time.Second)
+	store := &scriptedStore{deliveries: []Run{{
+		ID: "orphan-1", Job: "test.rebuild", Attempt: 1, EnqueuedAt: enqueued, Owner: "alice",
+	}}}
+	status := newFakeStatus() // deliberately no row: publish landed, status did not
+	r, err := NewRunner(context.Background(), Options{Workers: 1, Store: store, Status: status})
+	if err != nil {
+		t.Fatal(err)
+	}
+	r.Start()
+	defer r.Stop(context.Background())
+
+	eventually(t, 2*time.Second, func() bool {
+		st, err := status.Get(context.Background(), "orphan-1")
+		return err == nil && st.State == StateSucceeded
+	})
+	st, _ := status.Get(context.Background(), "orphan-1")
+	if st.Owner != "alice" || st.Job != "test.rebuild" || !st.EnqueuedAt.Equal(enqueued) {
+		t.Errorf("rebuilt row must keep the original identity: %+v", st)
+	}
+	if st.Result["p"] != "v" {
+		t.Errorf("rebuilt run result = %v", st.Result)
+	}
+	if atomic.LoadInt32(&ran) != 1 || store.completions() != 1 {
+		t.Fatalf("run executed once and acked once: ran=%d completed=%d", ran, store.completions())
+	}
+}
+
+func TestRedeliveryResubmitsStagedResult(t *testing.T) {
+	resetRegistry()
+	var invocations int32
+	registerTestJob(t, "test.resubmit", func(context.Context, Params) (Params, error) {
+		atomic.AddInt32(&invocations, 1)
+		return Params{"answer": "42"}, nil
+	})
+
+	gate2 := make(chan struct{})
+	store := &scriptedStore{
+		gate2: gate2,
+		deliveries: []Run{
+			{ID: "run-r", Job: "test.resubmit", Attempt: 1, EnqueuedAt: time.Now()},
+			{ID: "run-r", Job: "test.resubmit", Attempt: 2, EnqueuedAt: time.Now()},
+		},
+	}
+	status := newFakeStatus()
+	status.commitFailFor["run-r"] = 1 // attempt 1's terminal save fails
+	r, err := NewRunner(context.Background(), Options{Workers: 2, Store: store, Status: status})
+	if err != nil {
+		t.Fatal(err)
+	}
+	r.Start()
+	defer r.Stop(context.Background())
+
+	// attempt 1 staged the result but failed to commit the terminal state.
+	eventually(t, 2*time.Second, func() bool {
+		st, err := status.Get(context.Background(), "run-r")
+		return err == nil && st.Result != nil && st.State == StateRunning
+	})
+	close(gate2) // redelivery
+
+	eventually(t, 2*time.Second, func() bool {
+		st, _ := status.Get(context.Background(), "run-r")
+		return st.State == StateSucceeded
+	})
+	st, _ := status.Get(context.Background(), "run-r")
+	if st.Attempt != 2 || st.Result["answer"] != "42" {
+		t.Fatalf("redelivery must commit the staged result at its attempt: %+v", st)
+	}
+	if n := atomic.LoadInt32(&invocations); n != 1 {
+		t.Fatalf("the job must not run again on result resubmission, invocations=%d", n)
+	}
+	if store.completions() != 1 || len(store.failed) != 0 {
+		t.Fatalf("exactly one ack, no nak: completed=%d failed=%v", store.completions(), store.failed)
+	}
+}
+
+func TestOldAttemptCannotFormTerminalState(t *testing.T) {
+	resetRegistry()
+	var invocations int32
+	started1 := make(chan struct{})
+	registerTestJob(t, "test.fence", func(_ context.Context, _ Params) (Params, error) {
+		n := atomic.AddInt32(&invocations, 1)
+		if n == 1 {
+			close(started1)
+			// keep working until the redelivery has taken over, then return
+			// late as the old owner.
+			for {
+				st, err := statusFence.Get(context.Background(), "run-f")
+				if err == nil && st.Attempt >= 2 {
+					return Params{"v": "old"}, nil
+				}
+				time.Sleep(2 * time.Millisecond)
+			}
+		}
+		return Params{"v": "new"}, nil
+	})
+
+	gate2 := make(chan struct{})
+	store := &scriptedStore{
+		gate2: gate2,
+		deliveries: []Run{
+			{ID: "run-f", Job: "test.fence", Attempt: 1, EnqueuedAt: time.Now()},
+			{ID: "run-f", Job: "test.fence", Attempt: 2, EnqueuedAt: time.Now()},
+		},
+	}
+	statusFence = newFakeStatus()
+	r, err := NewRunner(context.Background(), Options{Workers: 2, Store: store, Status: statusFence})
+	if err != nil {
+		t.Fatal(err)
+	}
+	r.Start()
+	defer r.Stop(context.Background())
+
+	select {
+	case <-started1:
+	case <-time.After(2 * time.Second):
+		t.Fatal("attempt 1 did not start")
+	}
+	eventually(t, 2*time.Second, func() bool {
+		st, err := statusFence.Get(context.Background(), "run-f")
+		return err == nil && st.Attempt == 1 && st.State == StateRunning
+	})
+	close(gate2) // heartbeat-timeout redelivery races attempt 1's result commit
+
+	eventually(t, 2*time.Second, func() bool {
+		st, _ := statusFence.Get(context.Background(), "run-f")
+		return st.State == StateSucceeded
+	})
+	st, _ := statusFence.Get(context.Background(), "run-f")
+	if st.Attempt != 2 || st.Result["v"] != "new" {
+		t.Fatalf("only the current attempt forms the terminal state: %+v", st)
+	}
+	if store.completions() != 1 {
+		t.Fatalf("the old owner must not ack; only attempt 2 completes: %d", store.completions())
+	}
+}
+
+var statusFence *fakeStatus
+
+func TestCancelQueuedRunBeforeFirstClaim(t *testing.T) {
+	resetRegistry()
+	ran := make(chan struct{}, 1)
+	registerTestJob(t, "test.cancelqueued", func(context.Context, Params) (Params, error) {
+		ran <- struct{}{}
+		return nil, nil
+	})
+
+	status := newFakeStatus()
+	now := time.Now()
+	// cancel landed while the run was queued.
+	if err := status.Put(context.Background(), Status{
+		RunID: "run-q", Job: "test.cancelqueued", State: StateCancelling, Attempt: 1,
+		EnqueuedAt: now, CancelRequested: true,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	store := &scriptedStore{deliveries: []Run{{ID: "run-q", Job: "test.cancelqueued", Attempt: 1, EnqueuedAt: now}}}
+	r, err := NewRunner(context.Background(), Options{Workers: 1, Store: store, Status: status})
+	if err != nil {
+		t.Fatal(err)
+	}
+	r.Start()
+	defer r.Stop(context.Background())
+
+	eventually(t, 2*time.Second, func() bool {
+		st, _ := status.Get(context.Background(), "run-q")
+		return st.State == StateCancelled
+	})
+	if store.completions() != 1 {
+		t.Fatal("a cancel before claim must be acked exactly once")
+	}
+	select {
+	case <-ran:
+		t.Fatal("the job must not execute when cancelled before its first claim")
+	default:
+	}
+}
+
+func TestObsoleteDeliveryForRevokedPlaceholder(t *testing.T) {
+	resetRegistry()
+	ran := make(chan struct{}, 1)
+	registerTestJob(t, "test.obsolete", func(context.Context, Params) (Params, error) {
+		ran <- struct{}{}
+		return nil, nil
+	})
+
+	status := newFakeStatus()
+	now := time.Now()
+	status.putPending("run-o",
+		Status{RunID: "run-o", Job: "test.obsolete", State: StateQueued, Attempt: 1, EnqueuedAt: now},
+		"key-o", now)
+	status.revokeDirect("run-o", "publication abandoned")
+
+	store := &scriptedStore{deliveries: []Run{{ID: "run-o", Job: "test.obsolete", Attempt: 1, EnqueuedAt: now}}}
+	r, err := NewRunner(context.Background(), Options{Workers: 1, Store: store, Status: status})
+	if err != nil {
+		t.Fatal(err)
+	}
+	r.Start()
+	defer r.Stop(context.Background())
+
+	eventually(t, 2*time.Second, func() bool { return store.completions() == 1 })
+	st, _ := status.Get(context.Background(), "run-o")
+	if st.State != StateFailed {
+		t.Errorf("revoked run must not be resurrected, got %q", st.State)
+	}
+	select {
+	case <-ran:
+		t.Fatal("an obsolete delivery must never execute the job")
+	default:
+	}
+}
+
+func TestRecoveryRevokesStalePendingReservations(t *testing.T) {
+	status := newFakeStatus()
+	old := time.Now().Add(-pendingPublishGrace - time.Minute)
+	fresh := time.Now()
+	status.putPending("stale",
+		Status{RunID: "stale", Job: "j", State: StateQueued, Attempt: 1, EnqueuedAt: old},
+		"k-stale", old)
+	status.putPending("fresh",
+		Status{RunID: "fresh", Job: "j", State: StateQueued, Attempt: 1, EnqueuedAt: fresh},
+		"k-fresh", fresh)
+
+	r, err := NewRunner(context.Background(), Options{Store: stubStore{}, Status: status})
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	go r.runRecovery(ctx)
+
+	eventually(t, 2*time.Second, func() bool {
+		st, err := status.Get(context.Background(), "stale")
+		return err == nil && st.State == StateFailed
+	})
+	if _, held := status.keyOf("stale"); held {
+		t.Error("stale placeholder must free its key")
+	}
+	if _, ok := status.pendingOf("stale"); !ok {
+		t.Error("marker is kept so a late message is acked as obsolete")
+	}
+	st, _ := status.Get(context.Background(), "fresh")
+	if st.State != StateQueued {
+		t.Error("a fresh, in-flight reservation must not be revoked")
+	}
+	now := time.Now()
+	if _, reserved, err := status.Reserve(context.Background(),
+		Status{RunID: "next", Job: "j", State: StateQueued, Attempt: 1, EnqueuedAt: now}, "k-stale"); err != nil || !reserved {
+		t.Fatalf("freed key must be reusable: reserved=%v err=%v", reserved, err)
 	}
 }

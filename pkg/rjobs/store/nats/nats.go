@@ -261,7 +261,11 @@ func (s *store) Enqueue(ctx context.Context, run rjobs.Run) (rjobs.RunID, error)
 		return "", errors.Wrap(err, "rjobs: marshalling run failed")
 	}
 
-	if _, err := s.js.Publish(s.subjectFor(run.Job), payload, nats.Context(ctx)); err != nil {
+	// The stable RunID is the Nats-Msg-Id: a server with a duplicate window
+	// suppresses an accidental re-publish of the same enqueue. Correctness for
+	// older servers comes from the status-store attempt fence, not from this.
+	if _, err := s.js.Publish(s.subjectFor(run.Job), payload,
+		nats.MsgId(string(run.ID)), nats.Context(ctx)); err != nil {
 		return "", errors.Wrap(err, "rjobs: publishing run failed")
 	}
 	return run.ID, nil
@@ -313,6 +317,14 @@ func (s *store) Claim(ctx context.Context) (rjobs.Run, error) {
 				s.log.Error().Err(err).Msg("rjobs: dropping undecodable run")
 				_ = msg.Term()
 				continue
+			}
+
+			// The delivery number is the real attempt: it survives a nak and
+			// an AckWait redelivery, unlike the Attempt baked into the payload,
+			// which always describes the first enqueue. The status-store fence
+			// keys on it to tell a current delivery from a stale old owner.
+			if meta, err := msg.Metadata(); err == nil && meta.NumDelivered > 0 {
+				run.Attempt = int(meta.NumDelivered)
 			}
 
 			s.track(run.ID, msg)

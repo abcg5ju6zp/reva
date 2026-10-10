@@ -11,10 +11,6 @@
 // WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 // See the License for the specific language governing permissions and
 // limitations under the License.
-//
-// In applying this license, CERN does not waive the privileges and immunities
-// granted to it by virtue of its status as an Intergovernmental Organization
-// or submit itself to any jurisdiction.
 
 package rjobs
 
@@ -22,36 +18,57 @@ import (
 	"context"
 	"testing"
 	"time"
-
-	"github.com/rs/zerolog"
 )
 
-// TestRecordStatusKeepsStartedAt guards against the terminal write blanking the
-// start time: recordStatus upserts the whole row, so it must carry StartedAt
-// forward from the running write, not just set FinishedAt.
-func TestRecordStatusKeepsStartedAt(t *testing.T) {
+// TestCommitTerminalCarriesTimestamps guards against the terminal write
+// blanking the start time recorded at adoption: the fenced commit must carry
+// StartedAt forward and set FinishedAt.
+func TestCommitTerminalCarriesTimestamps(t *testing.T) {
 	status := newFakeStatus()
-	r := &Runner{status: status}
-	run := Run{ID: "r-startedat", Job: "test.startedat", EnqueuedAt: time.Now()}
-	started := time.Now().Truncate(time.Second)
+	ctx := context.Background()
+	enqueued := time.Now().Add(-time.Minute).Truncate(time.Second)
+	started := enqueued.Add(time.Second)
 
-	r.recordStatus(context.Background(), run, StateRunning, nil, nil, started, zerolog.Nop())
-	r.recordStatus(context.Background(), run, StateSucceeded, Params{"ok": true}, nil, started, zerolog.Nop())
+	if err := status.Put(ctx, Status{
+		RunID: "r-startedat", Job: "test.startedat", State: StateQueued,
+		Attempt: 1, EnqueuedAt: enqueued,
+	}); err != nil {
+		t.Fatal(err)
+	}
 
-	got, err := status.Get(context.Background(), run.ID)
+	if _, _, err := status.Adopt(ctx, Status{
+		RunID: "r-startedat", Job: "test.startedat", Attempt: 1, EnqueuedAt: enqueued,
+	}, 1); err != nil {
+		t.Fatal(err)
+	}
+
+	finished := time.Now()
+	committed, err := status.CommitTerminal(ctx, Status{
+		RunID: "r-startedat", Job: "test.startedat", State: StateSucceeded,
+		Attempt: 1, EnqueuedAt: enqueued, StartedAt: &started, FinishedAt: &finished,
+		Result: Params{"ok": true},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !committed {
+		t.Fatal("the owning attempt should form the terminal state")
+	}
+
+	got, err := status.Get(ctx, "r-startedat")
 	if err != nil {
 		t.Fatalf("Get: %v", err)
 	}
 	if got.State != StateSucceeded {
 		t.Fatalf("state = %q, want succeeded", got.State)
 	}
-	if got.StartedAt == nil {
-		t.Fatal("StartedAt was blanked on the terminal write")
-	}
-	if !got.StartedAt.Equal(started) {
+	if got.StartedAt == nil || !got.StartedAt.Equal(started) {
 		t.Fatalf("StartedAt = %v, want %v", got.StartedAt, started)
 	}
-	if got.FinishedAt == nil {
-		t.Fatal("FinishedAt not set on the terminal write")
+	if got.FinishedAt == nil || !got.FinishedAt.Equal(finished) {
+		t.Fatalf("FinishedAt = %v, want %v", got.FinishedAt, finished)
+	}
+	if got.Result["ok"] != true {
+		t.Fatalf("result = %v, want ok=true", got.Result)
 	}
 }

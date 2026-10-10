@@ -25,6 +25,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"time"
 
 	"github.com/cs3org/reva/v3/cmd/revad/pkg/config"
 	"github.com/cs3org/reva/v3/pkg/errtypes"
@@ -70,10 +71,12 @@ func (s *store) Put(ctx context.Context, st rjobs.Status) error {
 	if err != nil {
 		return err
 	}
-	// later transition. The reservation column is owned by Reserve/Release and
-	// the cancel intent by RequestCancel, so both are omitted here: a lifecycle
-	// write must never wipe a live reservation or clobber a concurrent cancel.
-	res := s.db.WithContext(ctx).Omit("ActiveDedupKey", "CancelRequested").Save(row)
+	// later transition. The reservation column is owned by Reserve/Release, the
+	// enqueue phase marker by Reserve/MarkCommitted/Revoke and the cancel intent
+	// by RequestCancel, so all three are omitted here: a lifecycle write must
+	// never wipe a live reservation, regress the commit phase or clobber a
+	// concurrent cancel.
+	res := s.db.WithContext(ctx).Omit("ActiveDedupKey", "PublishPendingAt", "CancelRequested").Save(row)
 	if res.Error != nil {
 		return errors.Wrap(res.Error, "rjobs sql: storing status failed")
 	}
@@ -164,6 +167,10 @@ func (s *store) Reserve(ctx context.Context, st rjobs.Status, key string) (rjobs
 			return rjobs.Status{}, false, err
 		}
 		row.ActiveDedupKey = &key
+		// enter the publish-pending commit phase: the placeholder exists from
+		// this insert until MarkCommitted confirms the queue publish.
+		pendingAt := time.Now()
+		row.PublishPendingAt = &pendingAt
 
 		// Insert unless (owner, key) is already taken: a unique-index conflict is
 		// the expected "key already held" case, so the database skips it instead
@@ -189,13 +196,261 @@ func (s *store) Reserve(ctx context.Context, st rjobs.Status, key string) (rjobs
 }
 
 func (s *store) Release(ctx context.Context, id rjobs.RunID) error {
+	// gorm skips a bare nil in a single-column Update, so spell out NULL.
 	res := s.db.WithContext(ctx).Model(&model.Run{}).
 		Where("run_id = ?", string(id)).
-		Update("active_dedup_key", nil)
+		Update("active_dedup_key", gorm.Expr("NULL"))
 	if res.Error != nil {
 		return errors.Wrap(res.Error, "rjobs sql: releasing reservation failed")
 	}
 	return nil
+}
+
+func (s *store) MarkCommitted(ctx context.Context, id rjobs.RunID) error {
+	// Only a still-pending queued row leaves the phase. A row revoked in the
+	// meantime is StateFailed with the marker left set on purpose, so its
+	// late-arriving message is recognised as obsolete.
+	res := s.db.WithContext(ctx).Model(&model.Run{}).
+		Where("run_id = ? AND state = ? AND publish_pending_at IS NOT NULL",
+			string(id), string(rjobs.StateQueued)).
+		Update("publish_pending_at", gorm.Expr("NULL"))
+	if res.Error != nil {
+		return errors.Wrap(res.Error, "rjobs sql: marking enqueue committed failed")
+	}
+	return nil
+}
+
+// revokeUpdate is the write that abandons a reservation: the run becomes a
+// failed record for observability and its dedup key is freed. The pending
+// marker is deliberately not part of the update, so it stays set and a message
+// published just before the crash is dropped at adoption instead of executing.
+func (s *store) revokeUpdate(q *gorm.DB, reason string) error {
+	now := time.Now()
+	return q.Updates(map[string]any{
+		"state":            string(rjobs.StateFailed),
+		"active_dedup_key": nil,
+		"finished_at":      now,
+		"last_error":       reason,
+	}).Error
+}
+
+func (s *store) Revoke(ctx context.Context, id rjobs.RunID, reason string) error {
+	q := s.db.WithContext(ctx).Model(&model.Run{}).
+		Where("run_id = ? AND state = ? AND publish_pending_at IS NOT NULL",
+			string(id), string(rjobs.StateQueued))
+	if err := s.revokeUpdate(q, reason); err != nil {
+		return errors.Wrap(err, "rjobs sql: revoking reservation failed")
+	}
+	return nil
+}
+
+func (s *store) RevokePending(ctx context.Context, grace time.Duration) ([]rjobs.RunID, error) {
+	cutoff := time.Now().Add(-grace)
+
+	var ids []string
+	if err := s.db.WithContext(ctx).Model(&model.Run{}).
+		Where("state = ? AND publish_pending_at IS NOT NULL AND publish_pending_at < ?",
+			string(rjobs.StateQueued), cutoff).
+		Pluck("run_id", &ids).Error; err != nil {
+		return nil, errors.Wrap(err, "rjobs sql: listing pending reservations failed")
+	}
+	if len(ids) == 0 {
+		return nil, nil
+	}
+
+	q := s.db.WithContext(ctx).Model(&model.Run{}).
+		Where("run_id IN ?", ids)
+	if err := s.revokeUpdate(q, "rjobs: enqueue interrupted before the run was published"); err != nil {
+		return nil, errors.Wrap(err, "rjobs sql: revoking pending reservations failed")
+	}
+
+	out := make([]rjobs.RunID, 0, len(ids))
+	for _, id := range ids {
+		out = append(out, rjobs.RunID(id))
+	}
+	return out, nil
+}
+
+func (s *store) Adopt(ctx context.Context, skeleton rjobs.Status, attempt int) (rjobs.AdoptDecision, rjobs.Status, error) {
+	if attempt <= 0 {
+		attempt = 1
+	}
+	id := string(skeleton.RunID)
+
+	// A few rows may move under concurrent deliveries; re-read and re-decide
+	// when a conditioned update loses a race.
+	for range 3 {
+		var row model.Run
+		err := s.db.WithContext(ctx).First(&row, "run_id = ?", id).Error
+		if errors.Is(err, gorm.ErrRecordNotFound) {
+			// No status row: the message reached the queue but the state write
+			// never did. Rebuild the ORIGINAL run's state from the identity
+			// carried by the message, so it is queryable instead of executing
+			// unknown.
+			now := time.Now()
+			row = model.Run{
+				RunID:      id,
+				Job:        skeleton.Job,
+				State:      string(rjobs.StateRunning),
+				Attempt:    attempt,
+				EnqueuedAt: skeleton.EnqueuedAt,
+				StartedAt:  &now,
+				Owner:      skeleton.Owner,
+			}
+			res := s.db.WithContext(ctx).Clauses(clause.OnConflict{DoNothing: true}).Create(&row)
+			if res.Error != nil {
+				return 0, rjobs.Status{}, errors.Wrap(res.Error, "rjobs sql: rebuilding missing run state failed")
+			}
+			if res.RowsAffected == 1 {
+				st, err := fromModel(row)
+				return rjobs.AdoptExecute, st, err
+			}
+			// a concurrent adoption created the row first; re-read and decide.
+			continue
+		}
+		if err != nil {
+			return 0, rjobs.Status{}, errors.Wrap(err, "rjobs sql: reading run for adoption failed")
+		}
+
+		state := rjobs.State(row.State)
+		switch {
+		case state == rjobs.StateSucceeded || state == rjobs.StateCancelled:
+			// already terminal: never run, never resurrect.
+			st, err := fromModel(row)
+			return rjobs.AdoptObsolete, st, err
+		case state == rjobs.StateFailed && row.PublishPendingAt != nil:
+			// a revoked placeholder: the publication was abandoned. Any message
+			// that still arrives for it is obsolete.
+			st, err := fromModel(row)
+			return rjobs.AdoptObsolete, st, err
+		case row.Attempt > attempt:
+			// this delivery belongs to an older attempt; a newer attempt owns
+			// the run now. The old owner must stand down.
+			st, err := fromModel(row)
+			return rjobs.AdoptObsolete, st, err
+		case row.Attempt == attempt && state == rjobs.StateRunning:
+			// a duplicate delivery of the attempt already being worked.
+			st, err := fromModel(row)
+			return rjobs.AdoptObsolete, st, err
+		}
+
+		// Take ownership: this delivery (possibly a redelivery) is the current
+		// attempt now.
+		resubmit := len(row.Result) > 0
+		nextState := string(rjobs.StateRunning)
+		if row.CancelRequested {
+			// a cancel landed while queued: keep winding down instead of
+			// flipping back to running.
+			nextState = string(rjobs.StateCancelling)
+		}
+		updates := map[string]any{
+			"attempt":            attempt,
+			"state":              nextState,
+			"finished_at":        nil,
+			"last_error":         "",
+			"publish_pending_at": nil, // the message physically exists: the enqueue is committed
+		}
+		if !resubmit {
+			now := time.Now()
+			updates["started_at"] = now
+		}
+		res := s.db.WithContext(ctx).Model(&model.Run{}).
+			Where("run_id = ? AND attempt = ?", id, row.Attempt).
+			Updates(updates)
+		if res.Error != nil {
+			return 0, rjobs.Status{}, errors.Wrap(res.Error, "rjobs sql: taking ownership of run failed")
+		}
+		if res.RowsAffected == 0 {
+			// a concurrent delivery moved the row first; re-decide.
+			continue
+		}
+
+		var updated model.Run
+		if err := s.db.WithContext(ctx).First(&updated, "run_id = ?", id).Error; err != nil {
+			return 0, rjobs.Status{}, errors.Wrap(err, "rjobs sql: reading adopted run failed")
+		}
+		st, err := fromModel(updated)
+		if err != nil {
+			return 0, rjobs.Status{}, err
+		}
+		if resubmit {
+			return rjobs.AdoptResubmit, st, nil
+		}
+		return rjobs.AdoptExecute, st, nil
+	}
+
+	return 0, rjobs.Status{}, errors.New("rjobs sql: run adoption contended repeatedly")
+}
+
+func (s *store) StageResult(ctx context.Context, id rjobs.RunID, attempt int, result rjobs.Params) error {
+	payload, err := marshalResult(result)
+	if err != nil {
+		return err
+	}
+	res := s.db.WithContext(ctx).Model(&model.Run{}).
+		Where("run_id = ? AND attempt = ? AND state IN ?",
+			string(id), attempt, []string{string(rjobs.StateRunning), string(rjobs.StateCancelling)}).
+		Update("result", payload)
+	if res.Error != nil {
+		return errors.Wrap(res.Error, "rjobs sql: staging run result failed")
+	}
+	if res.RowsAffected == 0 {
+		return errors.Errorf("rjobs sql: cannot stage result, run %q attempt %d no longer owns the run", id, attempt)
+	}
+	return nil
+}
+
+func (s *store) MarkFailed(ctx context.Context, id rjobs.RunID, attempt int, lastError string, at time.Time) (bool, error) {
+	// A durable cancel intent (StateCancelling) wins over the failure, like the
+	// worker's in-process cancel flag: the run is left for the next delivery to
+	// finalise as cancelled instead of being retried as failed.
+	res := s.db.WithContext(ctx).Model(&model.Run{}).
+		Where("run_id = ? AND attempt = ? AND state NOT IN ?",
+			string(id), attempt,
+			[]string{string(rjobs.StateSucceeded), string(rjobs.StateCancelled), string(rjobs.StateCancelling)}).
+		Updates(map[string]any{
+			"state":       string(rjobs.StateFailed),
+			"finished_at": at,
+			"last_error":  lastError,
+		})
+	if res.Error != nil {
+		return false, errors.Wrap(res.Error, "rjobs sql: recording failed attempt failed")
+	}
+	return res.RowsAffected == 1, nil
+}
+
+func (s *store) CommitTerminal(ctx context.Context, st rjobs.Status) (bool, error) {
+	payload, err := marshalResult(st.Result)
+	if err != nil {
+		return false, err
+	}
+	finished := time.Now()
+	if st.FinishedAt != nil {
+		finished = *st.FinishedAt
+	}
+
+	// A cancel commit may leave StateRunning (a cancel that reached the worker
+	// only through the broadcast); a success commit may not win once a durable
+	// cancel intent has recorded StateCancelling — the redelivery finalises the
+	// run as cancelled. Neither write can touch an already terminal row.
+	excluded := []string{string(rjobs.StateSucceeded), string(rjobs.StateCancelled)}
+	if st.State == rjobs.StateSucceeded {
+		excluded = append(excluded, string(rjobs.StateCancelling))
+	}
+	res := s.db.WithContext(ctx).Model(&model.Run{}).
+		Where("run_id = ? AND attempt = ? AND state NOT IN ?",
+			string(st.RunID), st.Attempt, excluded).
+		Updates(map[string]any{
+			"state":       string(st.State),
+			"started_at":  st.StartedAt,
+			"finished_at": finished,
+			"last_error":  st.LastError,
+			"result":      payload,
+		})
+	if res.Error != nil {
+		return false, errors.Wrap(res.Error, "rjobs sql: committing terminal state failed")
+	}
+	return res.RowsAffected == 1, nil
 }
 
 // activeHolder loads the run currently holding key for owner, if any.
@@ -223,14 +478,23 @@ func (s *store) Close(ctx context.Context) error {
 	return db.Close()
 }
 
+// marshalResult encodes a run result for the JSON column. A nil result is a
+// SQL NULL, distinct from an empty JSON object.
+func marshalResult(st rjobs.Params) (datatypes.JSON, error) {
+	if st == nil {
+		return nil, nil
+	}
+	b, err := json.Marshal(st)
+	if err != nil {
+		return nil, errors.Wrap(err, "rjobs sql: marshalling result failed")
+	}
+	return b, nil
+}
+
 func toModel(st rjobs.Status) (*model.Run, error) {
-	var result datatypes.JSON
-	if st.Result != nil {
-		b, err := json.Marshal(st.Result)
-		if err != nil {
-			return nil, errors.Wrap(err, "rjobs sql: marshalling result failed")
-		}
-		result = b
+	result, err := marshalResult(st.Result)
+	if err != nil {
+		return nil, err
 	}
 	m := &model.Run{
 		RunID:           string(st.RunID),

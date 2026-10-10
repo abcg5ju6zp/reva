@@ -49,6 +49,14 @@ type Run struct {
 	// unconstrained.
 	ActiveDedupKey *string `gorm:"size:255;uniqueIndex:idx_active_dedup,priority:2"`
 
+	// PublishPendingAt marks the enqueue commit phase. It is set when Reserve
+	// inserts the row (the dedup placeholder exists before the queue message
+	// is published) and cleared by MarkCommitted once the publish is confirmed.
+	// It is deliberately LEFT set when the reservation is revoked (Revoke/
+	// RevokePending): a message that then reaches a worker late is recognised
+	// as obsolete at adoption instead of executing.
+	PublishPendingAt *time.Time `gorm:"index"`
+
 	// CancelRequested is set once a cancellation has been requested for the run.
 	CancelRequested bool
 }

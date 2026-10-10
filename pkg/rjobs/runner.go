@@ -40,6 +40,16 @@ const defaultRetryAfter = 30 * time.Second
 // schedulerTick is how often the scheduler loop checks for due periodic jobs.
 const schedulerTick = 10 * time.Second
 
+// recoveryTick is how often the recovery loop looks for dedup placeholders
+// stuck in the publish-pending phase of an enqueue whose process died.
+const recoveryTick = 30 * time.Second
+
+// pendingPublishGrace is how long a publish-pending reservation is trusted as
+// an enqueue still in flight before recovery revokes it. It is well above the
+// bounded publish request time, so a live enqueue is never revoked; a possible
+// late message for a revoked row is dropped at adoption, never executed.
+const pendingPublishGrace = time.Minute
+
 // Options configures a Runner.
 type Options struct {
 	// Workers is the number of concurrent workers draining the durable queue.
@@ -86,22 +96,33 @@ type Runner struct {
 // runHandle is the per-run cancellation handle held while a run executes on
 // this process. cancel stops the run's context; cancelled records that the stop
 // was an explicit cancellation and not a shutdown, so execRun finalises the run
-// as cancelled instead of retrying it. once keeps tripping it idempotent across
-// the several places that may request it (a direct local cancel, the cancel
-// broadcast, the backstop poll).
+// as cancelled instead of retrying it. stale records that a newer delivery
+// attempt took the run over, so this owner must stand down without forming any
+// terminal state. once keeps the stop idempotent across the several places
+// that may request it (a direct local cancel, the cancel broadcast, the
+// backstop poll, the attempt-fence watcher).
 type runHandle struct {
 	job       string
 	started   time.Time
 	cancel    context.CancelFunc
 	cancelled atomic.Bool
+	stale     atomic.Bool
 	once      sync.Once
 }
 
-// trip marks the run cancelled and cancels its context. Only the first call has
-// an effect.
+// trip marks the run cancelled and cancels its context. Only the first stop
+// request has an effect.
 func (h *runHandle) trip() {
 	h.once.Do(func() {
 		h.cancelled.Store(true)
+		h.cancel()
+	})
+}
+
+// standDown marks the run lost to a newer attempt and cancels its context.
+func (h *runHandle) standDown() {
+	h.once.Do(func() {
+		h.stale.Store(true)
 		h.cancel()
 	})
 }
@@ -184,6 +205,7 @@ func (r *Runner) Start() {
 	}
 
 	r.wg.Go(func() { r.runScheduler(ctx) })
+	r.wg.Go(func() { r.runRecovery(ctx) })
 
 	for i := 0; i < r.workers; i++ {
 		r.wg.Go(func() { r.runDispatcher(ctx) })
@@ -241,6 +263,14 @@ func (r *Runner) Enqueue(ctx context.Context, name string, p Params, opts ...Enq
 		o(&run)
 	}
 
+	// Fix the stable identity before any write, so the queue message, the
+	// status record and the dedup placeholder all refer to the same run and a
+	// crashed commit phase can be resumed against that identity instead of
+	// spawning a second run.
+	run.ID = RunID(uuid.NewString())
+	run.Attempt = 1
+	run.EnqueuedAt = time.Now()
+
 	if run.DedupKey != "" {
 		return r.enqueueUnique(ctx, run)
 	}
@@ -250,31 +280,34 @@ func (r *Runner) Enqueue(ctx context.Context, name string, p Params, opts ...Enq
 		return "", err
 	}
 
+	// Enqueue without a dedup key keeps its original best-effort semantics:
+	// the message is the durable fact, and a failed status write does not fail
+	// the enqueue. The gap is healed when the message is claimed — Adopt
+	// rebuilds the original run's status from the identity carried by the
+	// message, so the run never executes unknown and becomes queryable.
 	if err := r.status.Put(ctx, Status{
 		RunID:      id,
 		Job:        name,
 		State:      StateQueued,
 		Attempt:    1,
-		EnqueuedAt: time.Now(),
+		EnqueuedAt: run.EnqueuedAt,
 		Owner:      run.Owner,
 	}); err != nil {
-		// the run is already durably queued; a failed status write must not
-		// fail the enqueue, only lose observability for this run.
-		r.log.Error().Err(err).Str("run", string(id)).Msg("rjobs: recording queued status failed")
+		r.log.Error().Err(err).Str("run", string(id)).Msg("rjobs: recording queued status failed; the run is rebuilt at claim")
 	}
 	return id, nil
 }
 
-// enqueueUnique enqueues a run that carries a Unique key. It reserves the key in
-// the status store before publishing, so two concurrent enqueues for the same
-// (owner, key) cannot both start a run: the reservation, backed by a unique
-// index, is the gate. On conflict it collapses onto the in-flight run (default)
-// or rejects, per the run's policy.
+// enqueueUnique enqueues a run that carries a Unique key through a recoverable
+// commit phase: (1) Reserve inserts the queued row and the dedup placeholder in
+// the publish-pending phase; (2) the queue message is published; (3)
+// MarkCommitted closes the phase. On conflict it collapses onto the in-flight
+// run (default) or rejects, per the run's policy. If the publish fails the
+// placeholder is revoked, so the key is never stuck; should the process die
+// between (1) and (3), the recovery loop revokes the pending placeholder after
+// a grace period. A message that nonetheless reached the queue for a revoked
+// row is recognised as obsolete when claimed and never executes.
 func (r *Runner) enqueueUnique(ctx context.Context, run Run) (RunID, error) {
-	run.ID = RunID(uuid.New().String())
-	run.Attempt = 1
-	run.EnqueuedAt = time.Now()
-
 	queued := Status{
 		RunID:      run.ID,
 		Job:        run.Job,
@@ -296,21 +329,22 @@ func (r *Runner) enqueueUnique(ctx context.Context, run Run) (RunID, error) {
 	}
 
 	if _, err := r.store.Enqueue(ctx, run); err != nil {
-		// the key is reserved but nothing reached the queue. Release it and mark
-		// the orphaned run failed, so the key is not stuck and no phantom queued
-		// run lingers.
-		if rerr := r.status.Release(ctx, run.ID); rerr != nil {
-			r.log.Error().Err(rerr).Str("run", string(run.ID)).Msg("rjobs: releasing reservation after failed enqueue errored")
-		}
-		now := time.Now()
-		failed := queued
-		failed.State = StateFailed
-		failed.FinishedAt = &now
-		failed.LastError = err.Error()
-		if perr := r.status.Put(ctx, failed); perr != nil {
-			r.log.Error().Err(perr).Str("run", string(run.ID)).Msg("rjobs: recording failed status after failed enqueue errored")
+		// The placeholder exists but publication failed: revoke it so the key
+		// is freed and the run is a failed record instead of a phantom queued
+		// row that would hold the key forever. The marker is kept, so a
+		// message the server may still have accepted is dropped at claim.
+		if rerr := r.status.Revoke(ctx, run.ID, errors.Wrap(err, "publishing run failed").Error()); rerr != nil {
+			r.log.Error().Err(rerr).Str("run", string(run.ID)).Msg("rjobs: revoking reservation after failed publish errored")
 		}
 		return "", err
+	}
+
+	// Publication is durable; leave the commit phase. If this write fails the
+	// row merely looks publish-pending: either the next claim clears the marker
+	// (the message physically exists) or the recovery loop revokes it, in which
+	// case the message is obsolete and is acked without running.
+	if err := r.status.MarkCommitted(ctx, run.ID); err != nil {
+		r.log.Error().Err(err).Str("run", string(run.ID)).Msg("rjobs: marking enqueue committed failed; recovery will reconcile")
 	}
 	return run.ID, nil
 }
@@ -561,27 +595,37 @@ func (r *Runner) runDispatcher(ctx context.Context) {
 	}
 }
 
-// execRun runs a claimed durable run (on-demand or leader periodic), records
-// its status transitions and acks/naks it. While the job runs it heartbeats
-// the store so a long run keeps its claim and is not redelivered.
+// execRun dispatches a claimed durable run. Leader periodic runs keep their
+// non-status, schedule-gated semantics; on-demand runs go through the
+// attempt-fenced status adoption path.
 func (r *Runner) execRun(ctx context.Context, run Run) {
+	if _, ok := r.lookupPeriodic(run.Job); ok {
+		r.execPeriodicRun(ctx, run)
+		return
+	}
+	r.execOnDemandRun(ctx, run)
+}
+
+// execPeriodicRun runs a claimed leader-scoped periodic run. Periodic runs are
+// not status-tracked: their cancel intent lives in the schedule store and
+// their retry semantics are the queue's plain nak/redeliver. While the job runs
+// it heartbeats so a long run keeps its claim and is not redelivered.
+func (r *Runner) execPeriodicRun(ctx context.Context, run Run) {
 	log := r.log.With().Str("job", run.Job).Str("run", string(run.ID)).Int("attempt", run.Attempt).Logger()
 
-	// once this run finishes, a leader-scoped periodic job is no longer in
-	// flight, so the scheduler may schedule it again. A run dropped by the
-	// overlap guard is the exception: it never owned the schedule mark, so the
-	// still-running owner must clear it, not this run.
+	// once this run finishes, the job is no longer in flight, so the scheduler
+	// may schedule it again. A run dropped by the overlap guard is the
+	// exception: it never owned the schedule mark, so the still-running owner
+	// must clear it, not this run.
 	var skippedOverlap bool
-	if r.isLeaderJob(run.Job) {
-		defer func() {
-			if skippedOverlap {
-				return
-			}
-			if err := r.store.ClearScheduledRunning(ctx, run.Job); err != nil {
-				log.Error().Err(err).Msg("rjobs: clearing schedule running mark failed")
-			}
-		}()
-	}
+	defer func() {
+		if skippedOverlap {
+			return
+		}
+		if err := r.store.ClearScheduledRunning(ctx, run.Job); err != nil {
+			log.Error().Err(err).Msg("rjobs: clearing schedule running mark failed")
+		}
+	}()
 
 	// Per-run cancellable context, registered so a cancel request can interrupt
 	// this specific run. It derives from ctx, so a shutdown still cancels it too;
@@ -595,31 +639,29 @@ func (r *Runner) execRun(ctx context.Context, run Run) {
 	// A cancellation may have arrived while the run was queued or waiting to be
 	// retried. Honour it before doing any work: drop the run as cancelled
 	// instead of executing it.
-	if r.cancelRequested(ctx, run) {
+	if r.periodicCancelRequested(ctx, run) {
 		log.Info().Msg("rjobs: run cancelled before it started")
-		r.finishCancelled(ctx, run, time.Time{}, log)
+		r.completeCancelled(ctx, run, log)
 		return
 	}
 
 	stopBeat := r.startHeartbeat(ctx, run, h, log)
 	defer stopBeat()
 
-	r.recordStatus(ctx, run, StateRunning, nil, nil, h.started, log)
-
-	result, err := r.invoke(runCtx, run, log)
+	_, err := r.invoke(runCtx, run, log)
 
 	// An explicit cancellation wins over the job's return value: the run is
 	// terminal and must not be retried, whether the job returned an error or
-	// not. A shutdown does not set this flag, so in-flight work is still retried
-	// after a restart.
+	// not. A shutdown does not set this flag, so in-flight work is still
+	// retried after a restart.
 	if h.cancelled.Load() {
 		log.Info().Msg("rjobs: run cancelled")
-		r.finishCancelled(ctx, run, h.started, log)
+		r.completeCancelled(ctx, run, log)
 		return
 	}
 
-	// An overlap-skip is an expected outcome, not a failure.
-	// So, we just ack and drop it, without a retry.
+	// An overlap-skip is an expected outcome, not a failure: ack and drop
+	// without a retry.
 	if errors.Is(err, errSkippedOverlap) {
 		skippedOverlap = true
 		log.Debug().Msg("rjobs: run skipped, previous run still in flight")
@@ -631,70 +673,238 @@ func (r *Runner) execRun(ctx context.Context, run Run) {
 
 	if err != nil {
 		log.Error().Err(err).Msg("rjobs: run failed")
-		r.recordStatus(ctx, run, StateFailed, nil, err, h.started, log)
 		if ferr := r.store.Fail(ctx, run.ID, defaultRetryAfter); ferr != nil {
 			log.Error().Err(ferr).Msg("rjobs: marking run failed errored")
 		}
 		return
 	}
 
-	r.recordStatus(ctx, run, StateSucceeded, result, nil, h.started, log)
-	if run.DedupKey != "" && r.status != nil {
-		// the run is done; free its Unique key so a new run can take it.
-		if err := r.status.Release(ctx, run.ID); err != nil {
-			log.Error().Err(err).Msg("rjobs: releasing dedup reservation errored")
-		}
-	}
 	if cerr := r.store.Complete(ctx, run.ID); cerr != nil {
 		log.Error().Err(cerr).Msg("rjobs: completing run errored")
 	}
 }
 
-// cancelRequested reports whether a cancellation has been requested for run. It
-// reads the durable cancel intent kept in the status store. Periodic runs are
-// not status-tracked, so this is always false for them; their cancellation is
-// driven separately through the schedule store.
-func (r *Runner) cancelRequested(ctx context.Context, run Run) bool {
-	if _, ok := r.lookupPeriodic(run.Job); ok {
-		// Periodic runs are not status-tracked; their cancel intent lives in the
-		// schedule store, keyed by job name.
-		req, err := r.store.ScheduledCancelRequested(ctx, run.Job)
-		if err != nil {
-			return false
-		}
-		return req
+// execOnDemandRun runs a claimed on-demand run behind the status-store attempt
+// fence. Adoption first reconciles the delivery with the durable status: it
+// rebuilds a missing row, hands the run to its current attempt, resubmits a
+// result an earlier attempt died while committing, or rejects an obsolete
+// delivery. From then on every lifecycle write is conditioned on this attempt,
+// so a redelivery after a heartbeat timeout and an old owner's late write can
+// neither re-run a completed job nor overwrite the current attempt.
+func (r *Runner) execOnDemandRun(ctx context.Context, run Run) {
+	log := r.log.With().Str("job", run.Job).Str("run", string(run.ID)).Int("attempt", run.Attempt).Logger()
+
+	runCtx, cancel := context.WithCancel(ctx)
+	h := &runHandle{job: run.Job, started: time.Now(), cancel: cancel}
+	r.registerRun(run.ID, h)
+	defer r.deregisterRun(run.ID)
+	defer cancel()
+
+	// Reconcile the delivery with the durable status. The skeleton is the
+	// stable identity carried by the queue message; it rebuilds the original
+	// run's state when the enqueue's status write was lost.
+	skeleton := Status{
+		RunID:      run.ID,
+		Job:        run.Job,
+		Attempt:    run.Attempt,
+		EnqueuedAt: run.EnqueuedAt,
+		Owner:      run.Owner,
 	}
-	st, err := r.status.Get(ctx, run.ID)
+	decision, st, err := r.status.Adopt(ctx, skeleton, run.Attempt)
 	if err != nil {
-		// A missing or unreadable status must not block execution; the run just
-		// misses its cancel check this round.
-		return false
+		// Without the fence we must neither run nor ack: leave the delivery to
+		// time out and be redelivered, when adoption is retried.
+		log.Error().Err(err).Msg("rjobs: adopting claimed run failed; leaving it for redelivery")
+		return
 	}
-	return st.CancelRequested
+	if decision == AdoptObsolete {
+		// terminal run, revoked placeholder, duplicate delivery or stale
+		// attempt: ack and do nothing — no unknown message may execute.
+		log.Info().Str("state", string(st.State)).Msg("rjobs: obsolete delivery acked without running")
+		if cerr := r.store.Complete(ctx, run.ID); cerr != nil {
+			log.Error().Err(cerr).Msg("rjobs: acking obsolete delivery errored")
+		}
+		return
+	}
+	if st.StartedAt != nil {
+		h.started = *st.StartedAt
+	}
+
+	// A cancellation that landed while the run was queued wins before any work.
+	if st.CancelRequested {
+		log.Info().Msg("rjobs: run cancelled before it started")
+		r.finishCancelledFenced(ctx, run, st, log)
+		return
+	}
+
+	stopBeat := r.startHeartbeat(ctx, run, h, log)
+	defer stopBeat()
+
+	var result Params
+	if decision == AdoptResubmit {
+		// An earlier attempt already produced and staged this result but died
+		// before the terminal commit. Hand the existing result back in instead
+		// of running the job again.
+		result = st.Result
+		log.Info().Msg("rjobs: resubmitting result staged by an earlier attempt")
+	} else {
+		result, err = r.invoke(runCtx, run, log)
+
+		// A newer attempt took over while the job ran (its redelivery was
+		// already claimed): stand down without any terminal write or ack.
+		if h.stale.Load() {
+			log.Info().Msg("rjobs: a newer attempt took over; standing down")
+			return
+		}
+		// An explicit cancellation wins over the job's return value. A shutdown
+		// does not set the flag, so in-flight work is retried.
+		if h.cancelled.Load() {
+			log.Info().Msg("rjobs: run cancelled")
+			r.finishCancelledFenced(ctx, run, st, log)
+			return
+		}
+		if err != nil {
+			r.failAttempt(ctx, run, err, log)
+			return
+		}
+
+		// Persist the result while still non-terminal. If the process dies
+		// after this and before the terminal commit, the redelivery adopts
+		// AdoptResubmit and commits this same result instead of re-running.
+		if serr := r.status.StageResult(ctx, run.ID, run.Attempt, result); serr != nil {
+			// A lost fence makes the commit a no-op anyway; a transient store
+			// error may still be salvaged by the commit carrying the result.
+			log.Warn().Err(serr).Msg("rjobs: staging result failed")
+		}
+	}
+
+	committed, cerr := r.commitTerminal(ctx, run, st.StartedAt, result, StateSucceeded, "", log)
+	if cerr != nil {
+		// The terminal state is not durable and the message is not acked: the
+		// lease lapses and the redelivery resubmits the staged result.
+		log.Error().Err(cerr).Msg("rjobs: committing succeeded state failed; redelivery will resubmit")
+		return
+	}
+	if !committed {
+		log.Info().Msg("rjobs: another attempt owns the run; not completing")
+		return
+	}
+
+	r.releaseReservation(ctx, run, log)
+	if err := r.store.Complete(ctx, run.ID); err != nil {
+		log.Error().Err(err).Msg("rjobs: completing run errored")
+	}
 }
 
-// finishCancelled records a run as cancelled and acks it so it is not
-// redelivered. Cancellation is terminal, unlike a failure.
-func (r *Runner) finishCancelled(ctx context.Context, run Run, started time.Time, log zerolog.Logger) {
-	r.recordStatus(ctx, run, StateCancelled, nil, nil, started, log)
-	if run.DedupKey != "" && r.status != nil {
-		if err := r.status.Release(ctx, run.ID); err != nil {
-			log.Error().Err(err).Msg("rjobs: releasing dedup reservation errored")
-		}
+// failAttempt records the failed attempt behind the fence and naks for the
+// ordinary retry. Losing the fence (a newer attempt already owns the run) or a
+// store error leaves the delivery unacked rather than retrying someone else's
+// attempt.
+func (r *Runner) failAttempt(ctx context.Context, run Run, jobErr error, log zerolog.Logger) {
+	log.Error().Err(jobErr).Msg("rjobs: run failed")
+	committed, err := r.status.MarkFailed(ctx, run.ID, run.Attempt, jobErr.Error(), time.Now())
+	if err != nil {
+		log.Error().Err(err).Msg("rjobs: recording failed attempt failed; leaving the run to redeliver")
+		return
 	}
+	if !committed {
+		log.Info().Msg("rjobs: another attempt owns the run; not failing it")
+		return
+	}
+	if ferr := r.store.Fail(ctx, run.ID, defaultRetryAfter); ferr != nil {
+		log.Error().Err(ferr).Msg("rjobs: marking run failed errored")
+	}
+}
+
+// commitTerminal writes a terminal status behind the attempt fence. Only the
+// writer that still owns the attempt forms the terminal state, so a completed
+// run cannot be resurrected by a late cancel and an old owner cannot overwrite
+// a newer attempt.
+func (r *Runner) commitTerminal(ctx context.Context, run Run, started *time.Time, result Params, state State, lastError string, log zerolog.Logger) (bool, error) {
+	now := time.Now()
+	st := Status{
+		RunID:      run.ID,
+		Job:        run.Job,
+		State:      state,
+		Attempt:    run.Attempt,
+		EnqueuedAt: run.EnqueuedAt,
+		StartedAt:  started,
+		FinishedAt: &now,
+		LastError:  lastError,
+		Result:     result,
+		Owner:      run.Owner,
+	}
+	committed, err := r.status.CommitTerminal(ctx, st)
+	if err != nil {
+		return false, err
+	}
+	if !committed {
+		return false, nil
+	}
+	return true, nil
+}
+
+// finishCancelledFenced commits the cancelled terminal state behind the
+// attempt fence and acks. A fence loss (newer attempt or the run already
+// terminal) stands down silently.
+func (r *Runner) finishCancelledFenced(ctx context.Context, run Run, adopted Status, log zerolog.Logger) {
+	committed, err := r.commitTerminal(ctx, run, adopted.StartedAt, nil, StateCancelled, "", log)
+	if err != nil {
+		log.Error().Err(err).Msg("rjobs: committing cancelled state failed; leaving the run to redeliver")
+		return
+	}
+	if !committed {
+		log.Info().Msg("rjobs: another attempt owns the run; not cancelling it")
+		return
+	}
+	r.releaseReservation(ctx, run, log)
 	if err := r.store.Complete(ctx, run.ID); err != nil {
 		log.Error().Err(err).Msg("rjobs: completing cancelled run errored")
 	}
 }
 
+// completeCancelled acks a cancelled periodic run. Periodic runs are not
+// status-tracked, so cancellation is terminal through the ack alone.
+func (r *Runner) completeCancelled(ctx context.Context, run Run, log zerolog.Logger) {
+	if err := r.store.Complete(ctx, run.ID); err != nil {
+		log.Error().Err(err).Msg("rjobs: completing cancelled run errored")
+	}
+}
+
+// releaseReservation frees a successful/cancelled unique run's dedup key. It
+// is a no-op for runs without a key.
+func (r *Runner) releaseReservation(ctx context.Context, run Run, log zerolog.Logger) {
+	if run.DedupKey == "" {
+		return
+	}
+	if err := r.status.Release(ctx, run.ID); err != nil {
+		log.Error().Err(err).Msg("rjobs: releasing dedup reservation errored")
+	}
+}
+
+// periodicCancelRequested reports the durable cancel intent for a periodic
+// run, which lives in the schedule store keyed by job name.
+func (r *Runner) periodicCancelRequested(ctx context.Context, run Run) bool {
+	req, err := r.store.ScheduledCancelRequested(ctx, run.Job)
+	if err != nil {
+		return false
+	}
+	return req
+}
+
 // startHeartbeat keeps a claimed run's lease alive by calling the store's
 // Heartbeat on a ticker until the returned stop function is called. It lets a
 // job run for arbitrarily long (minutes or days) without being redelivered.
+// The tick is also the backstop watcher: for on-demand runs it notices both a
+// durable cancel intent and a newer attempt that took over, for periodic runs
+// the schedule-store cancel intent.
 func (r *Runner) startHeartbeat(ctx context.Context, run Run, h *runHandle, log zerolog.Logger) (stop func()) {
 	interval := r.store.HeartbeatInterval()
 	if interval <= 0 {
 		return func() {}
 	}
+
+	_, periodic := r.lookupPeriodic(run.Job)
 
 	done := make(chan struct{})
 	go func() {
@@ -710,11 +920,29 @@ func (r *Runner) startHeartbeat(ctx context.Context, run Run, h *runHandle, log 
 				if err := r.store.Heartbeat(ctx, run.ID); err != nil {
 					log.Warn().Err(err).Msg("rjobs: heartbeat failed")
 				}
-				// Backstop for a cancel that did not reach this worker by the
-				// fast path: notice the durable cancel intent and stop the run.
-				// It keeps beating afterwards so the lease stays alive while the
-				// job winds down.
-				if !h.cancelled.Load() && r.cancelRequested(ctx, run) {
+				if h.cancelled.Load() || h.stale.Load() {
+					continue
+				}
+				if periodic {
+					if r.periodicCancelRequested(ctx, run) {
+						log.Info().Msg("rjobs: cancellation observed, stopping run")
+						h.trip()
+					}
+					continue
+				}
+				// On-demand: a missing/unreadable status must not stop the run;
+				// the lease simply keeps being extended.
+				st, err := r.status.Get(ctx, run.ID)
+				if err != nil {
+					continue
+				}
+				switch {
+				case st.Attempt > run.Attempt:
+					// The lease lapsed and a newer delivery adopted the run:
+					// this old owner stops so its late writes cannot win.
+					log.Info().Int("new_attempt", st.Attempt).Msg("rjobs: a newer attempt took over; standing down")
+					h.standDown()
+				case st.CancelRequested:
 					log.Info().Msg("rjobs: cancellation observed, stopping run")
 					h.trip()
 				}
@@ -726,44 +954,43 @@ func (r *Runner) startHeartbeat(ctx context.Context, run Run, h *runHandle, log 
 	return func() { once.Do(func() { close(done) }) }
 }
 
-// recordStatus upserts a run's status. Periodic runs (those matching a
-// registered periodic job) are not tracked: their observability comes from the
-// scheduler, not the per-run status store.
-func (r *Runner) recordStatus(ctx context.Context, run Run, state State, result Params, runErr error, started time.Time, log zerolog.Logger) {
-	if r.status == nil {
-		return
-	}
-	if _, ok := r.lookupPeriodic(run.Job); ok {
+// runRecovery reconciles enqueues whose commit phase was interrupted. On
+// startup it runs immediately, so a restarted process advances the original
+// phase instead of recreating or running the job, and then periodically revokes
+// dedup placeholders whose publish was never confirmed. Claim-time adoption
+// covers the other two interrupted phases (a missing status row and an
+// uncommitted terminal result).
+func (r *Runner) runRecovery(ctx context.Context) {
+	sweeper, ok := r.status.(interface {
+		RevokePending(ctx context.Context, grace time.Duration) ([]RunID, error)
+	})
+	if !ok {
 		return
 	}
 
-	now := time.Now()
-	st := Status{
-		RunID:      run.ID,
-		Job:        run.Job,
-		State:      state,
-		Attempt:    run.Attempt,
-		EnqueuedAt: run.EnqueuedAt,
-		Result:     result,
-		Owner:      run.Owner,
-	}
-	// StartedAt travels with every write once the run has begun: recordStatus
-	// upserts the whole row, so a terminal write that omitted it would blank the
-	// start time recorded at StateRunning.
-	if !started.IsZero() {
-		s := started
-		st.StartedAt = &s
-	}
-	switch state {
-	case StateSucceeded, StateFailed, StateCancelled:
-		st.FinishedAt = &now
-	}
-	if runErr != nil {
-		st.LastError = runErr.Error()
+	sweep := func() {
+		ids, err := sweeper.RevokePending(ctx, pendingPublishGrace)
+		if err != nil {
+			if ctx.Err() == nil {
+				r.log.Error().Err(err).Msg("rjobs: recovering pending reservations failed")
+			}
+			return
+		}
+		for _, id := range ids {
+			r.log.Warn().Str("run", string(id)).Msg("rjobs: revoked a reservation whose publish was never confirmed")
+		}
 	}
 
-	if err := r.status.Put(ctx, st); err != nil {
-		log.Error().Err(err).Str("state", string(state)).Msg("rjobs: recording status failed")
+	sweep()
+	ticker := time.NewTicker(recoveryTick)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			sweep()
+		}
 	}
 }
 

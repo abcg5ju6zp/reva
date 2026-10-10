@@ -79,6 +79,25 @@ type Status struct {
 // behalf of a user, i.e. it carries no owner.
 func (s Status) Internal() bool { return s.Owner == "" }
 
+// AdoptDecision is the claim-time reconciliation decision for one delivery.
+type AdoptDecision int
+
+const (
+	// AdoptExecute means this delivery now owns the run at its attempt: the
+	// worker should run the job. The decision also covers a delivery whose
+	// status row was missing: the row has been rebuilt from the identity
+	// carried by the queue message, so the run is queryable again.
+	AdoptExecute AdoptDecision = iota
+	// AdoptResubmit means an earlier attempt already produced and durably
+	// staged a result but died before the terminal commit. The worker must
+	// commit the returned status's Result without running the job again.
+	AdoptResubmit
+	// AdoptObsolete means the delivery must not run: the run already reached
+	// a terminal state, its enqueue was revoked before publication, or a
+	// newer attempt already owns the run. The worker acks the message.
+	AdoptObsolete
+)
+
 // ListFilter narrows a run listing. The zero value matches every run; the
 // common use is to set Owner so a user sees only their own runs.
 type ListFilter struct {
@@ -112,14 +131,60 @@ type StatusStore interface {
 	// List returns the runs matching the filter, most recently enqueued first.
 	List(ctx context.Context, f ListFilter) ([]Status, error)
 	// Reserve persists s as a queued run while enforcing at most one active run
-	// per (Owner, key). If the key is already held by an active run it stores
-	// nothing and returns that run with reserved=false; otherwise it stores s
-	// and returns reserved=true.
+	// per (Owner, key). The row is written in the publish-pending commit
+	// phase: MarkCommitted clears the phase once the queue message is known to
+	// be published, and Revoke/RevokePending abandon it when publication never
+	// happened. If the key is already held by an active run it stores nothing
+	// and returns that run with reserved=false; otherwise it stores s and
+	// returns reserved=true.
 	Reserve(ctx context.Context, s Status, key string) (existing Status, reserved bool, err error)
 	// Release drops a run's uniqueness reservation once it no longer needs it
 	// (it succeeded, or it never reached the queue), freeing the key for a new
 	// run. It is a no-op for a run that holds no reservation.
 	Release(ctx context.Context, id RunID) error
+	// MarkCommitted advances a reserved run out of the publish-pending phase
+	// once its queue message has been published. A row revoked in the meantime
+	// is left untouched (its message is obsolete and dropped at claim).
+	MarkCommitted(ctx context.Context, id RunID) error
+	// Revoke abandons a single reserved run whose queue publish failed
+	// synchronously: it moves the run to StateFailed and frees the dedup key,
+	// but keeps the publish-pending marker so a late-arriving message is
+	// recognised as obsolete. reason is recorded as the run's last error.
+	Revoke(ctx context.Context, id RunID, reason string) error
+	// RevokePending abandons every reserved run still in the publish-pending
+	// phase whose reservation is older than grace, i.e. enqueues that died
+	// between Reserve and a confirmed publish (typically a crashed enqueuer).
+	// It frees their dedup keys and returns the revoked run ids.
+	RevokePending(ctx context.Context, grace time.Duration) ([]RunID, error)
+	// Adopt reconciles one queue delivery with the durable status and is the
+	// single attempt fence: after AdoptExecute or AdoptResubmit the row's
+	// Attempt equals attempt and this delivery owns the run's lifecycle writes.
+	// A missing row is rebuilt from skeleton — the stable identity (id, job,
+	// owner, enqueue time) carried by the queue message — so a message that
+	// reached the queue without a status row becomes queryable instead of
+	// running unknown. A newer Attempt, a terminal row or a revoked
+	// reservation yields AdoptObsolete; a result staged by an earlier attempt
+	// yields AdoptResubmit.
+	Adopt(ctx context.Context, skeleton Status, attempt int) (decision AdoptDecision, current Status, err error)
+	// StageResult durably records a succeeded run's result while the run is
+	// still non-terminal, conditioned on the caller owning the attempt. If the
+	// process dies after this write and before CommitTerminal, the redelivery
+	// adopts AdoptResubmit and commits the staged result instead of running
+	// the job again.
+	StageResult(ctx context.Context, id RunID, attempt int, result Params) error
+	// MarkFailed records a failed attempt conditioned on the caller owning
+	// the attempt. It returns false (and writes nothing) when a newer attempt
+	// took over or the run is already terminal, so an old owner's late failure
+	// can neither overwrite the new attempt nor trigger its retry.
+	MarkFailed(ctx context.Context, id RunID, attempt int, lastError string, at time.Time) (bool, error)
+	// CommitTerminal writes a terminal status (succeeded or cancelled)
+	// conditioned on the caller owning the attempt and the row not already
+	// being terminal. It returns false when the caller lost the fence, so only
+	// the current attempt may form a terminal state: a completed run cannot be
+	// resurrected by a late cancel and an old owner's late write cannot
+	// overwrite a newer attempt. Neither the dedup reservation nor the cancel
+	// intent are touched by the commit.
+	CommitTerminal(ctx context.Context, s Status) (bool, error)
 	// RequestCancel records that a run should be cancelled and returns its
 	// updated status. It is a targeted write of the cancel intent, not a full
 	// status upsert, so it does not race with the worker's lifecycle writes. It
