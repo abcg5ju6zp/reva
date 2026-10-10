@@ -40,6 +40,7 @@ import (
 	"google.golang.org/grpc/codes"
 	gstatus "google.golang.org/grpc/status"
 
+	"github.com/cs3org/reva/v3/pkg/editsession"
 	"github.com/cs3org/reva/v3/pkg/errtypes"
 	"github.com/cs3org/reva/v3/pkg/rgrpc/status"
 	"github.com/cs3org/reva/v3/pkg/service"
@@ -52,9 +53,13 @@ type transferClaims struct {
 	jwt.RegisteredClaims
 	Target     string `json:"target"`
 	VersionKey string `json:"version_key,omitempty"`
+	// generation extension; empty/zero for plain downloads.
+	Resource string `json:"resource,omitempty"`
+	Gen      int64  `json:"gen,omitempty"`
+	UploadID string `json:"upload_id,omitempty"`
 }
 
-func (s *svc) sign(_ context.Context, target, versionKey string) (string, error) {
+func (s *svc) sign(_ context.Context, target, versionKey string, ext ...editsession.TransferExtension) (string, error) {
 	// Tus sends a separate request to the datagateway service for every chunk.
 	// For large files, this can take a long time, so we extend the expiration
 	ttl := time.Duration(s.c.TransferExpires) * time.Second
@@ -66,6 +71,11 @@ func (s *svc) sign(_ context.Context, target, versionKey string) (string, error)
 		},
 		Target:     target,
 		VersionKey: versionKey,
+	}
+	if len(ext) > 0 {
+		claims.Resource = ext[0].ResourceKey
+		claims.Gen = ext[0].Generation
+		claims.UploadID = ext[0].UploadSessionID
 	}
 
 	t := jwt.NewWithClaims(jwt.GetSigningMethod("HS256"), claims)
@@ -204,6 +214,25 @@ func (s *svc) InitiateFileUpload(ctx context.Context, req *provider.InitiateFile
 		}, nil
 	}
 
+	// register the in-flight save bound to the current generation. While a
+	// generation moves the registration is frozen; the transfer token below
+	// carries the generation claims the commit gate validates.
+	var ext editsession.TransferExtension
+	if s.coord != nil && !isReissue(ctx) {
+		if rid, ok := s.resourceOf(ctx, req.Ref); ok {
+			upload := &editsession.InFlightUpload{
+				ID: uuid.New().String(), Resource: rid,
+			}
+			if err := s.coord.BeginUpload(ctx, upload); err != nil {
+				return &gateway.InitiateFileUploadResponse{Status: errToStatus(err)}, nil
+			}
+			ext = editsession.TransferExtension{
+				ResourceKey: rid.Key(), Generation: upload.Generation,
+				UploadSessionID: upload.ID,
+			}
+		}
+	}
+
 	protocols := make([]*gateway.FileUploadProtocol, len(storageRes.Protocols))
 	for p := range storageRes.Protocols {
 		protocols[p] = &gateway.FileUploadProtocol{
@@ -224,7 +253,7 @@ func (s *svc) InitiateFileUpload(ctx context.Context, req *provider.InitiateFile
 
 			// TODO(labkode): calculate signature of the whole request? we only sign the URI now. Maybe worth https://tools.ietf.org/html/draft-cavage-http-signatures-11
 			target := u.String()
-			token, err := s.sign(ctx, target, "")
+			token, err := s.sign(ctx, target, "", ext)
 			if err != nil {
 				return &gateway.InitiateFileUploadResponse{
 					Status: status.NewInternal(ctx, err, "error creating signature for upload"),
@@ -365,6 +394,12 @@ func (s *svc) Move(ctx context.Context, req *provider.MoveRequest) (*provider.Mo
 		return &provider.MoveResponse{
 			Status: status.NewInternal(ctx, err, "error connecting to storage provider="+srcProvider.Address),
 		}, nil
+	}
+
+	// generation coordination only for lock-capable resources with open
+	// editing sessions; everything else takes the legacy path.
+	if res, handled, err := s.genMoveIfEligible(ctx, c, req); handled || err != nil {
+		return res, err
 	}
 
 	return c.Move(ctx, req)
@@ -508,8 +543,20 @@ func (s *svc) RefreshLock(ctx context.Context, req *provider.RefreshLockRequest)
 	return res, nil
 }
 
-// Unlock removes an existing lock from the given reference.
+// Unlock removes an existing lock from the given reference. With coordination
+// enabled the generation gate rejects old-reference unlocks and drives the
+// current-generation unlock itself.
 func (s *svc) Unlock(ctx context.Context, req *provider.UnlockRequest) (*provider.UnlockResponse, error) {
+	if s.coord != nil {
+		if rid, ok := s.resourceOf(ctx, req.Ref); ok {
+			err := s.coord.Unlock(ctx, rid, req.Ref, req.Lock)
+			if err != nil {
+				return &provider.UnlockResponse{Status: errToStatus(err)}, nil
+			}
+			return &provider.UnlockResponse{Status: &rpc.Status{Code: rpc.Code_CODE_OK}}, nil
+		}
+	}
+
 	c, err := s.find(ctx, req.Ref)
 	if err != nil {
 		return &provider.UnlockResponse{

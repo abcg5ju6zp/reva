@@ -22,6 +22,7 @@ import (
 	"context"
 	"sync"
 
+	gateway "github.com/cs3org/go-cs3apis/cs3/gateway/v1beta1"
 	collaboration "github.com/cs3org/go-cs3apis/cs3/sharing/collaboration/v1beta1"
 	storageregistry "github.com/cs3org/go-cs3apis/cs3/storage/registry/v1beta1"
 	revaservice "github.com/cs3org/reva/v3/pkg/service"
@@ -49,6 +50,20 @@ func (r *testResolver) UserShareProvider(context.Context) (collaboration.Collabo
 	defer r.mu.Unlock()
 	return r.shares, nil
 }
+
+// Gateway returns an error instead of falling through to the nil embedded
+// Clients method (which would panic). Tests that need scope expansion against
+// a gateway stub their own resolver; under the shared resolver the call is a
+// clean failure, the same outcome as having no resolver installed.
+func (r *testResolver) Gateway(context.Context) (gateway.GatewayAPIClient, error) {
+	return nil, errNoGateway
+}
+
+var errNoGateway = simpleErr("test resolver: no gateway peer installed")
+
+type simpleErr string
+
+func (e simpleErr) Error() string { return string(e) }
 
 var (
 	globalTestResolver     = &testResolver{}

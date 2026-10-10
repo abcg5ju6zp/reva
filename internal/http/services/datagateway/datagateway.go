@@ -21,6 +21,7 @@ package datagateway
 import (
 	"context"
 	"crypto/tls"
+	"fmt"
 	"io"
 	"net/http"
 	"net/url"
@@ -29,6 +30,8 @@ import (
 	"time"
 
 	"github.com/cs3org/reva/v3/pkg/appctx"
+	"github.com/cs3org/reva/v3/pkg/editsession"
+	sqlstore "github.com/cs3org/reva/v3/pkg/editsession/store/sql"
 	"github.com/cs3org/reva/v3/pkg/errtypes"
 	"github.com/cs3org/reva/v3/pkg/httpclient"
 	"github.com/cs3org/reva/v3/pkg/registry"
@@ -55,15 +58,25 @@ type transferClaims struct {
 	jwt.RegisteredClaims
 	Target     string `json:"target"`
 	VersionKey string `json:"version_key,omitempty"`
+	// generation extension; empty/zero for traffic without an editing session.
+	Resource string `json:"resource,omitempty"`
+	Gen      int64  `json:"gen,omitempty"`
+	UploadID string `json:"upload_id,omitempty"`
 }
 type config struct {
 	Prefix               string `mapstructure:"prefix"`
-	TransferSharedSecret string `mapstructure:"transfer_shared_secret"                                  validate:"required"`
+	TransferSharedSecret string `mapstructure:"transfer_shared_secret" validate:"required"`
 	Timeout              int64  `mapstructure:"timeout"`
 	Insecure             bool   `docs:"false;Whether to skip certificate checks when sending requests." mapstructure:"insecure"`
 	// PublicURL is the externally reachable URL of this data gateway, advertised
 	// in the registry. If empty, consumers reconstruct it from scheme+address+prefix.
 	PublicURL string `mapstructure:"public_url"`
+
+	// CommitCheck enables the generation gate on uploads: the service opens
+	// the editsession store and rejects saves bound to a non-current
+	// generation before proxying them. Default false keeps legacy behavior.
+	CommitCheck     bool `mapstructure:"commit_check"`
+	sqlstore.Config `mapstructure:",squash"`
 }
 
 func (c *config) ApplyDefaults() {
@@ -78,6 +91,9 @@ type svc struct {
 	conf    *config
 	handler http.Handler
 	client  *httpclient.Client
+
+	// gate, when non-nil, validates the generation of an upload.
+	gate *editsession.Coordinator
 }
 
 // New returns a new datagateway.
@@ -87,12 +103,22 @@ func New(ctx context.Context, m map[string]any) (global.Service, error) {
 		return nil, err
 	}
 
+	var gate *editsession.Coordinator
+	if c.CommitCheck {
+		store, err := sqlstore.NewWithConfig(ctx, &c.Config)
+		if err != nil {
+			return nil, fmt.Errorf("datagateway: opening editsession store: %w", err)
+		}
+		gate = editsession.NewCommitGate(store)
+	}
+
 	tr := &http.Transport{
 		TLSClientConfig: &tls.Config{InsecureSkipVerify: c.Insecure},
 	}
 
 	s := &svc{
 		conf: &c,
+		gate: gate,
 		client: httpclient.New(
 			httpclient.Timeout(time.Duration(c.Timeout*int64(time.Second))),
 			httpclient.RoundTripper(tr),
@@ -310,6 +336,23 @@ func (s *svc) doPut(w http.ResponseWriter, r *http.Request) {
 		log.Err(err).Str("token", r.Header.Get(TokenTransportHeader)).Msg("invalid transfer token")
 		w.WriteHeader(http.StatusForbidden)
 		return
+	}
+
+	// generation gate: only uploads carrying an editing-session claim are
+	// checked; plain WebDAV saves without it proxy exactly as before.
+	if s.gate != nil && claims.UploadID != "" {
+		if err := s.gate.CommitAllowed(ctx, claims.UploadID); err != nil {
+			// the rejection is distinguishable from a proxy/network failure:
+			// a conflict with the current generation is 409.
+			log.Warn().Err(err).Str("upload", claims.UploadID).Msg("upload rejected by generation gate")
+			w.Header().Set("Content-Length", "0")
+			if errors.Is(err, editsession.ErrGenerationMismatch) {
+				w.WriteHeader(http.StatusConflict)
+			} else {
+				w.WriteHeader(http.StatusInternalServerError)
+			}
+			return
+		}
 	}
 
 	target := claims.Target

@@ -37,6 +37,20 @@ transfer_expires = 6 # give it a moment
 #disable_home_creation_on_login = true
 link_grants_file = "/var/tmp/reva/link_grants_file.json"
 
+# Generation coordination for moves of files open in an app. Disabled by
+# default; when enabling it:
+#  * an HTTP appprovider service must be running (its internal endpoints),
+#    and app_handoff_url must point at its prefix;
+#  * the data gateway must set commit_check=true and both services must use
+#    the same editsession database below, otherwise stale upload tokens are
+#    not rejected and the protection silently does not apply.
+[grpc.services.gateway.editsession]
+enabled = false
+# db_engine = "sqlite"
+# db_name = "/var/tmp/reva/edit-sessions.db"
+# app_handoff_url = "http://localhost:19001/app"
+# app_handoff_secret = "replace-me-with-handoff-secret"
+
 [grpc.services.authregistry]
 driver = "static"
 
@@ -76,3 +90,15 @@ address = "0.0.0.0:19001"
 
 [http.services.datagateway]
 transfer_shared_secret = "replace-me-with-a-transfer-secret"
+# Reject saves that do not match the current generation. Must stay in sync
+# with [grpc.services.gateway.editsession]: enable both, point at the same
+# database. When commit_check is false, uploads proxy without a generation
+# check (legacy behavior).
+# commit_check = true
+# db_engine = "sqlite"
+# db_name = "/var/tmp/reva/edit-sessions.db"
+
+# The HTTP appprovider service hosts the app callback and the internal
+# handoff endpoints used by the gateway (active when internal_secret set).
+#[http.services.appprovider]
+#internal_secret = "replace-me-with-handoff-secret"

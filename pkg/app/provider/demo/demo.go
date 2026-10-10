@@ -28,6 +28,7 @@ import (
 	provider "github.com/cs3org/go-cs3apis/cs3/storage/provider/v1beta1"
 	"github.com/cs3org/reva/v3/pkg/app"
 	"github.com/cs3org/reva/v3/pkg/app/provider/registry"
+	"github.com/cs3org/reva/v3/pkg/editsession"
 	"github.com/cs3org/reva/v3/pkg/utils/cfg"
 )
 
@@ -40,7 +41,14 @@ type demoProvider struct {
 }
 
 func (p *demoProvider) GetAppURL(ctx context.Context, resource *provider.ResourceInfo, viewMode appprovider.ViewMode, token string, language string) (*appprovider.OpenInAppURL, string, error) {
-	url := fmt.Sprintf("<iframe src=%s/open/%s?view-mode=%s&access-token=%s&lang=%s />", p.iframeUIProvider, resource.Id.StorageId+":"+resource.Id.OpaqueId, viewMode.String(), token, language)
+	url := fmt.Sprintf("<iframe src=%s/open/%s?view-mode=%s&access-token=%s&lang=%s",
+		p.iframeUIProvider, resource.Id.StorageId+":"+resource.Id.OpaqueId, viewMode.String(), token, language)
+	// embed the editing-session identity when the gateway attached it, so
+	// the app correlates its callbacks with the session and generation.
+	if sid, _, gen, ok := editsession.DecodeSessionOpaque(resource.GetOpaque()); ok {
+		url += fmt.Sprintf("&session-id=%s&generation=%d", sid, gen)
+	}
+	url += " />"
 	return &appprovider.OpenInAppURL{
 		AppUrl: url,
 		Method: http.MethodGet,

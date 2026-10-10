@@ -29,6 +29,7 @@ import (
 	"path/filepath"
 	"regexp"
 	"strconv"
+	"time"
 
 	apppb "github.com/cs3org/go-cs3apis/cs3/app/provider/v1beta1"
 	appregistry "github.com/cs3org/go-cs3apis/cs3/app/registry/v1beta1"
@@ -39,6 +40,7 @@ import (
 	"github.com/cs3org/reva/v3/internal/http/services/datagateway"
 	"github.com/cs3org/reva/v3/internal/http/services/owncloud/ocdav"
 	"github.com/cs3org/reva/v3/pkg/appctx"
+	"github.com/cs3org/reva/v3/pkg/editsession"
 	"github.com/cs3org/reva/v3/pkg/httpclient"
 	"github.com/cs3org/reva/v3/pkg/rgrpc/status"
 	"github.com/cs3org/reva/v3/pkg/rhttp/global"
@@ -65,6 +67,9 @@ type Config struct {
 	// FeedbackRecipient is the email address user feedback submitted through the
 	// /feedback endpoint is sent to. Empty disables the endpoint.
 	FeedbackRecipient string `mapstructure:"feedback_recipient"`
+	// InternalSecret authenticates gateway server-to-server calls to the
+	// generation endpoints. Empty disables those endpoints.
+	InternalSecret string `mapstructure:"internal_secret"`
 }
 
 func (c *Config) ApplyDefaults() {
@@ -77,6 +82,11 @@ func (c *Config) ApplyDefaults() {
 type svc struct {
 	conf   *Config
 	router *chi.Mux
+
+	// verifier checks session tokens on app callbacks.
+	verifier *editsession.TokenSigner
+	// callbacks backs the save state the gateway reconciles against.
+	callbacks *callbackState
 }
 
 // New returns a new ocmd object.
@@ -106,6 +116,21 @@ func (s *svc) routerInit() error {
 	s.router.Post("/notify", s.handleNotify)
 	s.router.Post("/mentions", s.handleMentions)
 	s.router.Post("/feedback", s.handleFeedback)
+
+	// generation handoff: gateway-facing internal endpoints and the
+	// application callback. Active only when a secret is configured.
+	if s.conf.InternalSecret != "" {
+		s.callbacks = newCallbackState()
+		verifier, err := editsession.NewTokenSigner(s.conf.InternalSecret, time.Hour)
+		if err != nil {
+			return err
+		}
+		s.verifier = verifier
+		s.router.Post("/callback", s.handleAppCallback)
+		s.router.Post("/internal/takeover", s.handleInternalTakeOver)
+		s.router.Post("/internal/confirm", s.handleInternalConfirm)
+		s.router.Get("/internal/savestate", s.handleInternalSaveState)
+	}
 	return nil
 }
 

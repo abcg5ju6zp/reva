@@ -29,6 +29,9 @@ import (
 	"google.golang.org/grpc"
 
 	"github.com/cs3org/reva/v3/internal/grpc/services/gateway/ratelimiters"
+	"github.com/cs3org/reva/v3/pkg/appctx"
+	"github.com/cs3org/reva/v3/pkg/editsession"
+	sqlstore "github.com/cs3org/reva/v3/pkg/editsession/store/sql"
 	"github.com/cs3org/reva/v3/pkg/errtypes"
 	"github.com/cs3org/reva/v3/pkg/notifications/backends"
 	"github.com/cs3org/reva/v3/pkg/rgrpc"
@@ -69,6 +72,9 @@ type config struct {
 	// LightweightHomeLayout is the path of the folder shared with a lightweight
 	// account as its home on login. Empty disables lightweight homes.
 	LightweightHomeLayout string `mapstructure:"lightweight_home_layout"`
+
+	// EditSession configures the generation move coordination.
+	EditSession editSessionConfig `mapstructure:"editsession"`
 }
 
 // sets defaults.
@@ -108,6 +114,9 @@ type svc struct {
 	eventLimiter         ratelimiters.Limiter
 	// Drains the NATS connection on service close
 	closeEventBackend func() error
+
+	// coord drives generation moves; nil when the feature is disabled.
+	coord *editsession.Coordinator
 }
 
 // New creates a new gateway svc that acts as a proxy for any grpc operation.
@@ -151,6 +160,23 @@ func New(ctx context.Context, m map[string]any) (rgrpc.Service, error) {
 	if err == nil {
 		s.resourceInfoCache = ricache
 		s.resourceInfoCacheTTL = time.Second * time.Duration(c.ResourceInfoCacheTTL)
+	}
+
+	if c.EditSession.Enabled {
+		store, err := sqlstore.NewWithConfig(ctx, &c.EditSession.Config)
+		if err != nil {
+			return nil, fmt.Errorf("gateway: opening editsession store: %w", err)
+		}
+		app := newHTTPAppProvider(c.EditSession.AppHandoffURL, c.EditSession.AppHandoffSecret)
+		s.coord = editsession.New(store,
+			svcStorage{s}, svcLocker{s}, app, svcEndpoints{s},
+			editsession.Config{DrainPoll: 20 * time.Millisecond})
+
+		// resume generations interrupted by a previous restart. A failure
+		// here is non-fatal: it is retried on the next move/recover.
+		if err := s.coord.Recover(ctx); err != nil {
+			appctx.GetLogger(ctx).Warn().Err(err).Msg("gateway: initial editsession recovery failed")
+		}
 	}
 
 	return s, nil

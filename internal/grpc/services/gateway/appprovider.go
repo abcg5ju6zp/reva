@@ -32,6 +32,7 @@ import (
 	rpc "github.com/cs3org/go-cs3apis/cs3/rpc/v1beta1"
 	storageprovider "github.com/cs3org/go-cs3apis/cs3/storage/provider/v1beta1"
 	typespb "github.com/cs3org/go-cs3apis/cs3/types/v1beta1"
+	"github.com/google/uuid"
 	"github.com/pkg/errors"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/credentials"
@@ -39,6 +40,7 @@ import (
 	"google.golang.org/grpc/metadata"
 
 	"github.com/cs3org/reva/v3/pkg/appctx"
+	"github.com/cs3org/reva/v3/pkg/editsession"
 	"github.com/cs3org/reva/v3/pkg/errtypes"
 	"github.com/cs3org/reva/v3/pkg/rgrpc/status"
 	"github.com/cs3org/reva/v3/pkg/service"
@@ -177,6 +179,18 @@ func (s *svc) openLocalResources(ctx context.Context, ri *storageprovider.Resour
 		}, nil
 	}
 
+	// only read-write opens are gated while a generation moves; read-only and
+	// preview opens keep going.
+	viewMode := providerpb.ViewMode(req.ViewMode)
+	if s.coord != nil && viewMode == providerpb.ViewMode_VIEW_MODE_READ_WRITE {
+		rid, err := editsession.ResourceIDFromCS3(ri.Id)
+		if err == nil {
+			if err := s.coord.CheckEditOpen(ctx, rid); err != nil {
+				return &providerpb.OpenInAppResponse{Status: errToStatus(err)}, nil
+			}
+		}
+	}
+
 	provider, err := s.findAppProvider(ctx, ri, req.App)
 	if err != nil {
 		err = errors.Wrap(err, "gateway: error calling findAppProvider")
@@ -193,9 +207,23 @@ func (s *svc) openLocalResources(ctx context.Context, ri *storageprovider.Resour
 		return nil, errors.Wrap(err, "gateway: error calling GetAppProviderClient")
 	}
 
+	// mint the editing-session identity before the call so the app/driver can
+	// embed it (via ResourceInfo.Opaque); the session row is only written
+	// after open succeeds.
+	sessionID := ""
+	if s.coord != nil && viewMode == providerpb.ViewMode_VIEW_MODE_READ_WRITE {
+		sessionID = uuid.New().String()
+		var sessionGen int64
+		if gens, err := s.coord.Store().ListGenerations(ctx, mustRID(ri)); err == nil && len(gens) > 0 {
+			sessionGen = gens[len(gens)-1].Sequence
+		}
+		ri.Opaque = mergeSessionOpaque(ri.Opaque,
+			editsession.EncodeSessionOpaque(sessionID, mustRID(ri).Key(), sessionGen))
+	}
+
 	appProviderReq := &providerpb.OpenInAppRequest{
 		ResourceInfo: ri,
-		ViewMode:     providerpb.ViewMode(req.ViewMode),
+		ViewMode:     viewMode,
 		AccessToken:  accessToken,
 		Opaque:       req.Opaque,
 	}
@@ -204,7 +232,54 @@ func (s *svc) openLocalResources(ctx context.Context, ri *storageprovider.Resour
 	if err != nil {
 		return nil, errors.Wrap(err, "gateway: error calling OpenInApp")
 	}
+
+	// open succeeded: register the session for read-write mode.
+	if s.coord != nil && viewMode == providerpb.ViewMode_VIEW_MODE_READ_WRITE && res.GetStatus().GetCode() == rpc.Code_CODE_OK {
+		rid, _ := editsession.ResourceIDFromCS3(ri.Id)
+		u := appctx.ContextMustGetUser(ctx)
+		sess := &editsession.Session{
+			ID: sessionID, Resource: rid,
+			User: u.Id, DisplayName: u.DisplayName,
+			AppProvider: provider.Name,
+		}
+		// correlate with a write lock already held for the resource when the
+		// app acquired it before/around open (the common WOPI order).
+		if lockRes, lerr := s.GetLock(ctx, &storageprovider.GetLockRequest{Ref: req.Ref}); lerr == nil && lockRes.GetStatus().GetCode() == rpc.Code_CODE_OK {
+			sess.LockID = lockRes.GetLock().GetLockId()
+		}
+		if err := s.coord.OpenSession(ctx, sess); err != nil {
+			if errors.Is(err, editsession.ErrFrozen) {
+				// a move landed while the app was opening: tell the client
+				// to retry against the new reference instead of failing with
+				// an opaque internal error.
+				return &providerpb.OpenInAppResponse{Status: errToStatus(err)}, nil
+			}
+			return nil, errors.Wrap(err, "gateway: error registering editing session")
+		}
+	}
 	return res, nil
+}
+
+func mustRID(ri *storageprovider.ResourceInfo) editsession.ResourceID {
+	r, _ := editsession.ResourceIDFromCS3(ri.Id)
+	return r
+}
+
+// mergeSessionOpaque merges the session-identity entries into o (without
+// mutating it).
+func mergeSessionOpaque(o *typespb.Opaque, session *typespb.Opaque) *typespb.Opaque {
+	out := &typespb.Opaque{Map: map[string]*typespb.OpaqueEntry{}}
+	if o != nil {
+		for k, v := range o.Map {
+			out.Map[k] = v
+		}
+	}
+	if session != nil {
+		for k, v := range session.Map {
+			out.Map[k] = v
+		}
+	}
+	return out
 }
 
 func (s *svc) findAppProvider(ctx context.Context, ri *storageprovider.ResourceInfo, app string) (*registry.ProviderInfo, error) {
